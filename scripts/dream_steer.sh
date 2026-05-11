@@ -1,0 +1,19 @@
+python eval_dream_steering.py \
+    --csv_path JBB \
+    --attack_method zeroshot \
+    --safe_reminder False \
+    --prefix False \
+    --model_path Dream-org/Dream-v0-Instruct-7B \
+    --generated_samples_path ./outputs/Dream_zeroshot\
+    --steering_vector_path steering_vectors_dream.pt \
+    --target_layer 27 \
+    --sampling_steps 128 \
+    --mask_length 128 \
+    --block_size 128 \
+    --dija_mask_counts 128 \
+    --steering_overshoot 1.0 \
+    --initial_steering_ratio 0.1 \
+    --max_refinement_iters 0 \
+    --sampler dream_remdm \
+    --remdm_number 4 \
+    --device cuda:0

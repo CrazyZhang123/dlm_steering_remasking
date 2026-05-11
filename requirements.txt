@@ -1,0 +1,15 @@
+accelerate==1.13.0
+datasets==4.8.4
+nltk==3.8.1
+numpy==1.26.4
+pandas==2.3.3
+peft==0.18.1
+pillow==10.4.0
+safetensors==0.7.0
+scikit-learn==1.7.2
+scipy==1.15.3
+torch==2.11.0
+tqdm==4.67.3
+transformers==4.49.0
+triton==3.6.0
+wheel==0.46.3
