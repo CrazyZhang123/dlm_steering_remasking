@@ -3,6 +3,10 @@
 
 > **Adaptive Steering and Remasking** proposes a training-free safety framework that prevents jailbreak attacks in diffusion language models by steering harmful generation trajectories during the denoising process.
 
+## 🛡️ DLM Steering and Remasking
+
+![overview](./assets/overview_figure.png)
+
 
 We proposes a training-free safety framework for diffusion language models that combines adaptive semantic steering and harmful token remasking during the denoising process.  
 
@@ -10,8 +14,8 @@ The method first constructs a **Contrastive Safety Direction (CSD)** to distingu
 
 It then performs **selective token remasking** to regenerate potentially harmful tokens, effectively reducing jailbreak attacks while preserving the fluency and overall quality of generated responses.
 
-## 🛡️ DLM Steering and Remasking
-![overview](./assets/overview_figure.png)
+## ⚙️ Method
+
 ### 1. Contrastive Safety Direction (CSD)
 We construct a latent safety direction that captures the semantic difference between `harmful responses` and `safe refusal responses`.
 
@@ -55,6 +59,8 @@ This local refinement improves safety while maintaining fluency and coherence.
 Our framework consistently reduces jailbreak attack success rates across `DIJA attacks`, `PAP attacks`, `Prefix attacks`, while preserving generation utility better than existing remasking-based defenses.
 
 ## 🛠️ Setup
+We used the `JailBreakBench` and `AdvBench` benchmark.
+### Setting Up the Environment
 ```bash
 $ conda create -n dlm_steering python=3.10
 $ conda activate dlm_steering
@@ -69,7 +75,7 @@ $ python make_csd_dream.py
 ```
 
 ### Inference
-#### Edit the shell scripts
+#### 1. Edit the `scripts/dream_steer.sh` or `scripts/llada_steer.sh` file
 ```txt
 python eval_llada_steering.py \
     --csv_path <dataset> \
@@ -100,12 +106,12 @@ If you want to use the DIJA attack:
 $ git clone https://github.com/ZichenWen1/DIJA.git
 ```
 
-#### Start inference
+#### 2. Start inference
 ```bash
 $ sh scripts/llada_steer.sh
 $ sh scripts/dream_steer.sh
 ```
-### Validation
+### Evaluation
 ```bash
 $ sh scripts/llama_guard.sh             # llama_guard (JailBreakBench, AdvBench)
 $ sh scripts/test_rouge_score.sh        # rouge_score (TruthfulQA)
