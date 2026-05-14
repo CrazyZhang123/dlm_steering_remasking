@@ -1,4 +1,4 @@
-python eval_llada_steering.py \
+python utils/eval_llada_steering.py \
     --csv_path JBB \
     --attack_method zeroshot \
     --self_reminder False \
