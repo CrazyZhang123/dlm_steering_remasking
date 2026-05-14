@@ -66,6 +66,7 @@ class DreamEvalHarness(LM):
         initial_steering_ratio=0.5,
         dija_mask_counts=36,
         inject_prompt=True,
+        attack_method='zeroshot',
     ):
         super().__init__()
 
@@ -103,6 +104,7 @@ class DreamEvalHarness(LM):
 
         self.generated_samples_path = generated_samples_path
         self.sampler = sampler
+        self.attack_method = attack_method
         self.remdm_number = remdm_number
 
         self.cfg = cfg
@@ -393,7 +395,7 @@ class DreamEvalHarness(LM):
         return xt
 
     @torch.no_grad()
-    def dream_remdm_sample(self, prompt):
+    def dream_steering_sample(self, prompt):
         P = prompt.shape[1]
         if self.inject_prompt:
             total_len = P + P + self.mask_length
@@ -581,7 +583,7 @@ class DreamEvalHarness(LM):
 
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]):
-        is_dija = self.sampler == 'dream_dija'
+        is_dija = self.attack_method == 'DIJA'
 
         def _tokenize(e):
             if is_dija:
@@ -628,10 +630,10 @@ class DreamEvalHarness(LM):
                 generated_answer = generated_answer.split("assistant\n")[0]
             else:
                 prompt = elem["question"].unsqueeze(0).to(self.device)
-                if self.sampler == 'dream_conf':
+                if self.sampler == 'llada':
                     generated_answer = self.dream_conf_sample(prompt)
-                elif self.sampler == 'dream_remdm':
-                    generated_answer = self.dream_remdm_sample(prompt)
+                elif self.sampler == 'steering':
+                    generated_answer = self.dream_steering_sample(prompt)
                 generated_answer = self.tokenizer.decode(
                     generated_answer[0][-self.mask_length:], skip_special_tokens=False
                 )
@@ -723,6 +725,7 @@ def run_csv_eval(args):
         initial_steering_ratio=args.initial_steering_ratio,
         dija_mask_counts=args.dija_mask_counts,
         inject_prompt=args.inject_prompt,
+        attack_method=args.attack_method,
     )
 
     if 'MATH' in args.csv_path:
@@ -730,7 +733,7 @@ def run_csv_eval(args):
             Instance(request_type="generate_until", doc={}, arguments=(row[question_key]+"\nFollowing the format: Solution: <solution>\nAnswer: <answer>", {"until": []}), idx=i)
             for i, row in enumerate(dataset)
         ]
-    elif args.safe_reminder == "True":
+    elif args.self_reminder == "True":
         requests = [
             Instance(request_type="generate_until", doc={}, arguments=(SAFE_REMINDER + "\n" + row[question_key], {"until": []}), idx=i)
             for i, row in enumerate(dataset)
@@ -750,7 +753,7 @@ def run_csv_eval(args):
             Instance(request_type="generate_until", doc={}, arguments=(row[question_key]+"\nChoose the index of the correct answer from the following choices: " + str(row['choices']) + "\nYou need to answer only the index of the correct answer.", {"until": []}), idx=i)
             for i, row in enumerate(dataset)
         ]
-    elif args.prefix == 'True':
+    elif args.attack_method == 'prefix':
         requests = [
             Instance(request_type="generate_until", doc={}, arguments=(REFERENCES[0] + " " + row[question_key], {"until": []}), idx=i)
             for i, row in enumerate(dataset)
@@ -786,16 +789,16 @@ if __name__ == "__main__":
         full_parser.add_argument("--sampling_steps", type=int, default=128)
         full_parser.add_argument("--mask_length", type=int, default=128)
         full_parser.add_argument("--block_size", type=int, default=128)
+        full_parser.add_argument("--dija_mask_counts", type=int, default=128)
+        full_parser.add_argument("--self_reminder", type=str, default="False")
         full_parser.add_argument("--remasking", type=str, default="low_confidence")
-        full_parser.add_argument("--sampler", type=str, default="dream_conf",
-                                 choices=["dream_conf", "dream_remdm", "dream_dija"])
-        full_parser.add_argument("--remdm_number", type=int, default=0)
-        full_parser.add_argument("--attack_method", type=str, default="zeroshot")
-        full_parser.add_argument("--safe_reminder", type=str, default="False")
+        full_parser.add_argument("--sampler", type=str, default="steering",
+                                 choices=["steering", "llada"])
+        full_parser.add_argument("--remdm_number", type=int, default=4)
+        full_parser.add_argument("--attack_method", type=str, default="zeroshot", choices=["DIJA", "prefix", "PAP", "zeroshot"])
         full_parser.add_argument("--cfg", type=float, default=0.)
         full_parser.add_argument("--device", type=str, default="cuda")
         full_parser.add_argument("--steering_vector_path", type=str, default='')
-        full_parser.add_argument("--prefix", type=str, default='False')
         full_parser.add_argument("--steering_overshoot", type=float, default=1.0,
                                  help="Beta multiplier on excess projection (a_t - threshold). "
                                       "1.0 = clip projection to threshold; >1.0 = push below threshold.")

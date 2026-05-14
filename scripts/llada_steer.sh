@@ -1,8 +1,7 @@
 python eval_llada_steering.py \
     --csv_path JBB \
     --attack_method zeroshot \
-    --safe_reminder False \
-    --prefix False \
+    --self_reminder False \
     --model_path GSAI-ML/LLaDA-8B-Instruct \
     --generated_samples_path ./outputs/LLaDA_zeroshot \
     --steering_vector_path steering_vectors2.pt \
@@ -10,10 +9,8 @@ python eval_llada_steering.py \
     --sampling_steps 128 \
     --mask_length 128 \
     --block_size 128 \
-    --dija_mask_counts 128 \
+    --sampler steering \
     --steering_overshoot 1.0 \
     --initial_steering_ratio 0.1 \
     --max_refinement_iters 5 \
-    --sampler llada_remdm \
-    --remdm_number 4 \
     --device cuda:0
