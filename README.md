@@ -70,8 +70,8 @@ $ mkdir outputs
 ## 🚀 Usage
 ### Making Contrastive Safety Direction
 ```bash
-$ python make_csd_llada.py
-$ python make_csd_dream.py
+$ python utils/make_csd_llada.py
+$ python utils/make_csd_dream.py
 ```
 
 ### Inference
