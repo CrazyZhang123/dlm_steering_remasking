@@ -8,13 +8,53 @@
 ![overview](./assets/overview_figure.png)
 
 
-We proposes a training-free safety framework for diffusion language models that combines adaptive semantic steering and harmful token remasking during the denoising process.  
+We proposes a training-free safety framework for diffusion language models (DLMs) that combines adaptive semantic steering and harmful token remasking during the denoising process.  
 
 The method first constructs a **Contrastive Safety Direction (CSD)** to distinguish harmful and safe semantic representations, and applies **adaptive steering** in the early denoising stages to guide generation toward safer trajectories.  
 
 It then performs **selective token remasking** to regenerate potentially harmful tokens, effectively reducing jailbreak attacks while preserving the fluency and overall quality of generated responses.
 
-## ⚙️ Method
+
+## Preliminary Analysis
+### Vulnerability of Early Denoising Steps
+<p align="center">
+  <img src="./assets/motivation01.png" alt="analysis" width="350"/>
+</p>
+
+DLMs exhibit a unique vulnerability during iterative denoising. Unlike autoregressive LLMs, tokens generated at early denoising steps strongly influence the entire generation trajectory. To analyze this behavior, we conduct a controlled first-token priming experiment.
+We insert either `Sure` (compliance-inducing token) or `Sorry` (refusal token) at different denoising steps during generation.
+
+### Observation
+Early harmful tokens strongly affect final outputs Injecting `Sure` at early denoising steps significantly increases jailbreak success rates. Injecting `Sorry` suppresses harmful generation.
+The influence becomes weaker at later denoising stages.
+> Early denoising trajectories play a critical role in determining final safety behavior
+
+
+### Limitation of Existing Defenses
+
+Existing remasking-based defenses mainly rely on global token suppression. 
+However, aggressive remasking introduces a severe trade-off:
+
+- harmful tokens are removed,
+- but useful semantic information is also destroyed.
+
+As a result, models often produce:
+
+- empty responses,
+- broken sentences,
+- degraded generation quality.
+
+This indicates that simply suppressing tokens is insufficient for safe DLM generation.
+
+### Motivation
+
+Instead of globally suppressing generation, we directly control the denoising trajectory through:
+- semantic steering  
+- selective harmful token remasking
+
+This allows the model to maintain generation quality while effectively reducing harmful outputs.
+
+## Method
 
 ### 1. Contrastive Safety Direction (CSD)
 We construct a latent safety direction that captures the semantic difference between `harmful responses` and `safe refusal responses`.
@@ -57,6 +97,38 @@ This local refinement improves safety while maintaining fluency and coherence.
 |||**Ours**|**8.00**|
 
 Our framework consistently reduces jailbreak attack success rates across `DIJA attacks`, `PAP attacks`, `Prefix attacks`, while preserving generation utility better than existing remasking-based defenses.
+
+
+## Aanalysis
+### Ablation Study
+
+We evaluate the contribution of each component in our framework.
+
+|Variant|Description|ASR (%) ↓|
+|-|-|-|
+|Full|Phase 1 + Phase 2|18|
+|w/o Phase 1|Remove adaptive steering|54|
+|w/o Phase 2-Steering|Remove steering during remasking|66|
+|w/o Phase 2|Remove remasking|56|
+|Baseline|Vanilla LLaDA|100|
+
+**Key Observations**
+- Early-step steering is critical for establishing safe denoising trajectories.
+- Remasking effectively suppresses harmful token propagation.
+- Combining steering and remasking achieves the strongest robustness.
+
+### Generalization Capability
+We additionally evaluate whether the defense preserves general model utility.
+
+Benchmarks: `TruthfulQA`, `MATH-500`, `MMLU`
+
+Compared to prior remasking-based defenses, our method better preserves:
+
+- reasoning capability
+- semantic consistency
+- generation fluency
+
+while still maintaining strong jailbreak robustness.
 
 ## 🛠️ Setup
 We used the `JailBreakBench` and `AdvBench` benchmark.
