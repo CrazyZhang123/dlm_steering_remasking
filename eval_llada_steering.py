@@ -4,23 +4,32 @@ import pandas as pd
 import random
 import numpy as np
 import torch.nn.functional as F
-from datasets import Dataset, load_dataset, concatenate_datasets
+from datasets import Dataset, load_dataset, load_from_disk, concatenate_datasets
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from tqdm import tqdm
 from utils import REFERENCES, SAFE_REMINDER
+from utils.ct_csd_bank import CTCSDBank
 from transformers import AutoTokenizer, AutoModel
 import json
 import os
 import re
+import importlib.util
 
 
 DIJA_MASK_PATTERN = r'<mask:(\d+)>'
 DIJA_MASK_TOKEN_STR = '<|mdm_mask|>'
 DIJA_START_TOKEN = '<startoftext>'
 DIJA_END_TOKEN = '<endoftext>'
+
+
+def save_partial_results(output_dir: str, rows: list[dict]) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "results.partial.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
 
 
 def set_seed(seed):
@@ -30,6 +39,33 @@ def set_seed(seed):
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def load_harmbench_prefix_templates():
+    module_path = os.path.join(
+        os.path.dirname(__file__),
+        "DIJA",
+        "benchmarks",
+        "HarmBench",
+        "baselines",
+        "human_jailbreaks",
+        "jailbreaks.py",
+    )
+    spec = importlib.util.spec_from_file_location("harmbench_human_jailbreaks", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return list(module.JAILBREAKS)
+
+
+def select_harmbench_prefix_templates(prefixes, random_subset=5, seed=1):
+    selected = list(prefixes)
+    if isinstance(random_subset, int):
+        rng = random.Random(seed)
+        rng.shuffle(selected)
+        if random_subset >= 0:
+            selected = selected[:random_subset]
+    return selected
 
 
 def _sample_categorical(categorical_probs):
@@ -62,7 +98,7 @@ class LLaDAEvalHarness(LM):
         steering_overshoot=1.0,
         target_layer=24,
         alignment_threshold=0.1,
-        max_refinement_iters=3,
+        max_refinement_iters=5,
         initial_steering_ratio=0.5,
         dija_mask_counts=36,
         inject_prompt=True,
@@ -80,7 +116,13 @@ class LLaDAEvalHarness(LM):
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            **model_kwargs,
+        )
         self.model.eval()
 
         self.device = torch.device(device)
@@ -115,6 +157,7 @@ class LLaDAEvalHarness(LM):
         print(self.generated_samples_path)
 
         self.steering_vector = None
+        self.steering_bank = None
         self.steering_overshoot = steering_overshoot
         self.target_layer = target_layer
         self.alignment_threshold = alignment_threshold
@@ -127,13 +170,21 @@ class LLaDAEvalHarness(LM):
                   "generation region; only the trailing mask_length tokens are decoded as output.")
         if steering_vector_path:
             print(f"Loading steering vector from {steering_vector_path}")
-            vectors = torch.load(steering_vector_path, weights_only=True)
-            key = f'layer_{target_layer}'
-            if key not in vectors:
-                available = list(vectors.keys())
-                raise ValueError(f"Layer {target_layer} not found. Available: {available}")
-            self.steering_vector = vectors[key]
-            print(f"Steering vector loaded (layer {target_layer}, norm={self.steering_vector.norm().item():.4f})")
+            obj = torch.load(steering_vector_path, map_location="cpu", weights_only=True)
+            if isinstance(obj, dict) and obj.get("format") == "ct_csd_v1":
+                if int(obj["target_layer"]) != int(target_layer):
+                    raise ValueError(
+                        f"Bank target_layer={obj['target_layer']} does not match requested target_layer={target_layer}"
+                    )
+                self.steering_bank = CTCSDBank.from_state_dict(obj, device=self.device, dtype=torch.float32)
+                print(f"CT-CSD bank loaded (layer {target_layer}, clusters={self.steering_bank.num_clusters})")
+            else:
+                key = f'layer_{target_layer}'
+                if key not in obj:
+                    available = list(obj.keys())
+                    raise ValueError(f"Layer {target_layer} not found. Available: {available}")
+                self.steering_vector = obj[key]
+                print(f"Steering vector loaded (layer {target_layer}, norm={self.steering_vector.norm().item():.4f})")
             print(f"steering_overshoot(beta)={steering_overshoot}, alignment_threshold={alignment_threshold}, "
                   f"initial_steering_ratio={initial_steering_ratio}, max_refinement_iters={max_refinement_iters}")
 
@@ -144,6 +195,9 @@ class LLaDAEvalHarness(LM):
     @property
     def world_size(self):
         return self._world_size
+
+    def _can_steer(self):
+        return self.steering_vector is not None or self.steering_bank is not None
 
     def _forward_process(self, batch, prompt_index):
         b, l = batch.shape
@@ -320,33 +374,62 @@ class LLaDAEvalHarness(LM):
 
     @torch.no_grad()
     def _extract_block_hidden(self, xt, block_start, block_end):
+        # 提取 block 区域 [block_start:block_end] 的隐藏状态
+        # 通过 forward hook 获取 target_layer 的输出，然后按 block 边界切片
         hidden_buffer = [None]
         def _extract_hook(module, input, output, _buf=hidden_buffer):
             h = output[0] if isinstance(output, tuple) else output
             _buf[0] = h.detach()
             return output
         handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(_extract_hook)
-        _ = self.model(xt).logits
-        handle.remove()
+        try:
+            _ = self.model(xt).logits
+        finally:
+            handle.remove()
         return hidden_buffer[0][:, block_start:block_end, :]
 
     @torch.no_grad()
     def _per_token_alignment(self, block_hidden):
+        # 计算 block 内每个 token 的 hidden state 与 steering vector 的对齐程度
+        # 返回正值越大，表示该 token 语义越接近有害方向
+        if self.steering_bank is not None:
+            return self.steering_bank.alignment(
+                block_hidden,
+                theta=self.alignment_threshold,
+                record=True,
+            )
         sv = self.steering_vector.to(block_hidden.device, dtype=block_hidden.dtype)
+        #  block_hidden 形状为 [1, block_size, hidden_dim]，sv_unit 形状为 [hidden_dim]
         sv_unit = sv / (sv.norm() + 1e-8)
         return (block_hidden * sv_unit).sum(dim=-1)
 
     def _build_adaptive_steering_hook(self, mask_index):
+        # 构建 adaptive steering forward hook
+        # 对 mask 位置的 hidden state 做 steering 修正：
+        #   - 先计算投影 a = hidden · sv_unit
+        #   - 如果 a > theta，则减去 alpha_t = beta * (a - theta) 倍的 sv_unit
+        #   - 如果 a <= theta，alpha_t = 0，不做扰动
+        # 核心思想：有害对齐强烈 → 引导力度强；有害对齐较弱 → 最小干预
         beta = self.steering_overshoot
         theta = self.alignment_threshold
         sv_ref = self.steering_vector
 
         def steering_hook(module, input, output, _mask_index=mask_index, _beta=beta, _theta=theta, _sv=sv_ref):
             hidden = output[0] if isinstance(output, tuple) else output
-            sv = _sv.to(hidden.device, dtype=hidden.dtype)
-            sv_unit = sv / (sv.norm() + 1e-8)
             hidden = hidden.clone()
             masked_h = hidden[_mask_index]                                  # [n_masked, D]
+            if self.steering_bank is not None:
+                hidden[_mask_index] = self.steering_bank.steer(
+                    masked_h,
+                    beta=_beta,
+                    theta=_theta,
+                ).to(hidden.dtype)
+                if isinstance(output, tuple):
+                    return (hidden,) + output[1:]
+                return hidden
+
+            sv = _sv.to(hidden.device, dtype=hidden.dtype)
+            sv_unit = sv / (sv.norm() + 1e-8)
             a = (masked_h * sv_unit.unsqueeze(0)).sum(dim=-1)               # [n_masked]
             alpha_t = _beta * (a - _theta).clamp(min=0)                     # [n_masked]
             hidden[_mask_index] = masked_h - alpha_t.unsqueeze(-1) * sv_unit.unsqueeze(0)
@@ -356,16 +439,22 @@ class LLaDAEvalHarness(LM):
         return steering_hook
 
     @torch.no_grad()
-    def _refill_masks_with_steering(self, xt, block_end):
+    def _refill_masks_with_steering(self, xt, block_start, block_end):
+        # Phase 2 辅助方法：对当前 block 的 mask 位置做一次 forward pass，
+        # 并用 adaptive steering 生成替换 token
         mask_index = (xt == self.mask_id)
+        mask_index[:, :block_start] = False
+        mask_index[:, block_end:] = False
         if not mask_index.any():
             return xt
 
         steering_hook = self._build_adaptive_steering_hook(mask_index)
         hook_handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(steering_hook)
 
-        logits = self.model(xt).logits
-        hook_handle.remove()
+        try:
+            logits = self.model(xt).logits
+        finally:
+            hook_handle.remove()
 
         p = F.softmax(logits.to(torch.float64), dim=-1)
         x0 = _sample_categorical(p)
@@ -375,6 +464,26 @@ class LLaDAEvalHarness(LM):
 
     @torch.no_grad()
     def llada_remask_sample(self, prompt):
+        # ==============================================================
+        # 两阶段安全生成：Adaptive Steering + Harmful Token Remasking
+        #
+        # Phase 1 (逐 block 解码):
+        #   - 将 mask_length 划分为 num_blocks 个 block
+        #   - 每个 block 内执行 steps 次 confidence-based 逐步解码
+        #   - 每次揭掉 confidence 最高的 k = mask_length / sampling_steps 个 token
+        #   - block 边界约束: x0_p[:, block_end:] = -np.inf，确保不跨 block
+        #   - 前 initial_steering_steps 步应用 adaptive steering hook
+        #
+        # Phase 2 (block 级安全检测 + remask):
+        #   - 一个 block 全部 steps 次迭代完成后才进入 Phase 2
+        #   - 提取 block 区域的 hidden states，计算 per-token alignment
+        #   - 将对齐超过 alignment_threshold 的 token 标记为有害
+        #   - 将有害 token 重新设回 mask_id，用 _refill_masks_with_steering 重新生成
+        #   - 最多重试 max_refinement_iters 次，直到 block 内无有害 token
+        #
+        # 不是每生成一个 token 就去检测安全，
+        # 而是等整个 block 的所有 token 解码完成后，才批量检测和 remask
+        # ==============================================================
         P = prompt.shape[1]
         if self.inject_prompt:
             total_len = P + P + self.mask_length
@@ -396,9 +505,10 @@ class LLaDAEvalHarness(LM):
 
         assert self.mask_length % self.sampling_steps == 0
 
-        can_steer = (self.steering_vector is not None)
+        can_steer = self._can_steer()
         initial_steering_steps = int(steps * self.initial_steering_ratio) if can_steer else 0
 
+        # ---- Phase 1: 逐 block 解码（confidence-based 逐步揭掩码） ----
         for num_block in range(num_blocks):
             block_start = prompt_len + num_block * self.block_size
             block_end = prompt_len + (num_block + 1) * self.block_size
@@ -406,6 +516,7 @@ class LLaDAEvalHarness(LM):
             for i in range(steps):
                 mask_index = (xt == self.mask_id)
 
+                # 前 initial_steering_steps 步可选的 adaptive steering
                 hook_handle = None
                 if can_steer and i < initial_steering_steps:
                     block_mask_index = mask_index.clone()
@@ -415,41 +526,51 @@ class LLaDAEvalHarness(LM):
                         steering_hook = self._build_adaptive_steering_hook(block_mask_index)
                         hook_handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(steering_hook)
 
-                logits = self.model(xt).logits
-
-                if hook_handle is not None:
-                    hook_handle.remove()
+                try:
+                    logits = self.model(xt).logits
+                finally:
+                    if hook_handle is not None:
+                        hook_handle.remove()
 
                 p = F.softmax(logits.to(torch.float64), dim=-1)
                 x0 = _sample_categorical(p)
                 x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
 
+                # block 边界约束：只允许在 block 范围内产生新 token
                 x0_p[:, block_end:] = -np.inf
                 x0 = torch.where(mask_index, x0, xt)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
 
+                # 只揭掉 confidence 最高的 k 个 token
                 transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                 for j in range(confidence.shape[0]):
                     _, select_index = torch.topk(confidence[j], k=int(self.mask_length / self.sampling_steps))
                     transfer_index[j, select_index] = True
                 xt[transfer_index] = x0[transfer_index]
 
+            # ---- Phase 2: block 全部解码完成后，做安全检测 + remask ----
             if can_steer:
                 for refinement_iter in range(self.max_refinement_iters):
+                    # 提取 block 的隐藏状态
                     block_hidden = self._extract_block_hidden(xt, block_start, block_end)
+                    # 计算每个 token 与 steering vector 的对齐程度
                     per_token_alignment = self._per_token_alignment(block_hidden)  # [1, block_size]
 
+                    # 检测有害 token：alignment 超过阈值的标记为有害
                     harmful_mask = per_token_alignment > self.alignment_threshold  # [1, block_size]
                     n_harmful = harmful_mask.sum().item()
 
                     if n_harmful == 0:
+                        # block 内没有有害 token，跳过 remask
                         break
 
+                    # 将有害 token 重掩码为 mask_id
                     full_harmful_mask = torch.zeros_like(xt, dtype=torch.bool)
                     full_harmful_mask[:, block_start:block_end] = harmful_mask
                     xt[full_harmful_mask] = self.mask_id
 
-                    xt = self._refill_masks_with_steering(xt, block_end)
+                    # 用 adaptive steering 重新生成
+                    xt = self._refill_masks_with_steering(xt, block_start, block_end)
 
             if torch.sum(xt == self.tokenizer.eos_token_id) > 0:
                 return xt
@@ -491,7 +612,7 @@ class LLaDAEvalHarness(LM):
         if not original_mask_index.any():
             return xt, matching_count
 
-        can_steer = (self.steering_vector is not None)
+        can_steer = self._can_steer()
         steps = self.sampling_steps
         initial_steering_steps = int(steps * self.initial_steering_ratio) if can_steer else 0
 
@@ -505,10 +626,11 @@ class LLaDAEvalHarness(LM):
                 steering_hook = self._build_adaptive_steering_hook(mask_index)
                 hook_handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(steering_hook)
 
-            logits = self.model(xt).logits
-
-            if hook_handle is not None:
-                hook_handle.remove()
+            try:
+                logits = self.model(xt).logits
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
 
             p = F.softmax(logits.to(torch.float64), dim=-1)
             x0 = _sample_categorical(p)
@@ -529,6 +651,9 @@ class LLaDAEvalHarness(LM):
                 transfer_index[j, select_index] = True
             xt[transfer_index] = x0[transfer_index]
 
+        # ---- Phase 2 (DIJA): 全部解码完成后做 batch remask ----
+        # 不同于 block 模式按 block 做 remask，DIJA 对整个序列一次性检测+remask
+        # harmful_mask 用 original_mask_index 过滤，只对初始就是 mask 的位置做 remask
         if can_steer:
             for refinement_iter in range(self.max_refinement_iters):
                 hidden_buffer = [None]
@@ -537,58 +662,58 @@ class LLaDAEvalHarness(LM):
                     _buf[0] = h.detach()
                     return output
                 handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(_extract_hook)
-                _ = self.model(xt).logits
-                handle.remove()
+                try:
+                    _ = self.model(xt).logits
+                finally:
+                    handle.remove()
 
                 full_hidden = hidden_buffer[0]
-                sv = self.steering_vector.to(full_hidden.device, dtype=full_hidden.dtype)
-                sv_unit = sv / (sv.norm() + 1e-8)
-                alignment = (full_hidden * sv_unit).sum(dim=-1)
+                if self.steering_bank is not None:
+                    alignment = self.steering_bank.alignment(
+                        full_hidden,
+                        theta=self.alignment_threshold,
+                        record=False,
+                    )
+                    _ = self.steering_bank.alignment(
+                        full_hidden[original_mask_index],
+                        theta=self.alignment_threshold,
+                        record=True,
+                    )
+                else:
+                    sv = self.steering_vector.to(full_hidden.device, dtype=full_hidden.dtype)
+                    sv_unit = sv / (sv.norm() + 1e-8)
+                    alignment = (full_hidden * sv_unit).sum(dim=-1)
 
                 harmful_mask = (alignment > self.alignment_threshold) & original_mask_index
                 if harmful_mask.sum().item() == 0:
                     break
 
                 xt[harmful_mask] = self.mask_id
-                xt = self._refill_masks_with_steering(xt, block_end=xt.shape[1])
+                xt = self._refill_masks_with_steering(xt, block_start=0, block_end=xt.shape[1])
 
         return xt, matching_count
 
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]):
-        is_dija = self.attack_moethod == 'DIJA'
-
-        def _tokenize(e):
-            if is_dija:
-                return {
-                    "question_text": e["question"],
-                    "vanilla_goal": e.get("vanilla_goal", e["question"]),
-                    "until": e["until"],
-                }
-            return {
-                "question": self.tokenizer(e["question"])["input_ids"],
-                "question_text": e["question"],
-                "until": e["until"],
-            }
-
-        if is_dija:
-            ds = [
-                {
-                    "question": req.args[0],
-                    "until": req.args[1]['until'],
-                    "vanilla_goal": req.args[1].get('vanilla_goal', req.args[0]),
-                }
-                for req in requests
-            ]
-        else:
-            ds = [{"question": req.args[0], "until": req.args[1]['until']} for req in requests]
-        ds = Dataset.from_list(ds)
-        ds = ds.map(_tokenize)
-        if not is_dija:
-            ds = ds.with_format("torch")
+        is_dija = self.attack_method == 'DIJA'
 
         out, out_for_json = [], []
-        for elem in tqdm(ds):
+        for req in tqdm(requests):
+            if is_dija:
+                elem = {
+                    "question_text": req.args[0],
+                    "vanilla_goal": req.args[1].get("vanilla_goal", req.args[0]),
+                    "until": req.args[1]["until"],
+                }
+            else:
+                elem = {
+                    "question": torch.tensor(
+                        self.tokenizer(req.args[0])["input_ids"],
+                        dtype=torch.long,
+                    ),
+                    "question_text": req.args[0],
+                    "until": req.args[1]["until"],
+                }
             stop_tokens = list(elem["until"]) + ["<|eot_id|>", self.tokenizer.eos_token]
 
             if is_dija:
@@ -619,17 +744,34 @@ class LLaDAEvalHarness(LM):
             generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
             out.append(generated_answer)
             out_for_json.append({
-                "prefix": elem["question_text"],
-                "result": generated_answer,
+                "prompt": elem["question_text"],
+                "response": generated_answer,
             })
+            if self.generated_samples_path:
+                save_partial_results(self.generated_samples_path, out_for_json)
 
             if self.accelerator is not None:
                 self.accelerator.wait_for_everyone()
 
         return out
 
+    def write_steering_diagnostics(self) -> None:
+        if self.steering_bank is None:
+            return
+        if self.accelerator is not None and not getattr(self.accelerator, "is_main_process", getattr(self, "_rank", 0) == 0):
+            return
+        os.makedirs(self.generated_samples_path, exist_ok=True)
+        out_path = os.path.join(self.generated_samples_path, "ct_csd_diagnostics.json")
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(self.steering_bank.diagnostics(), handle, indent=2, ensure_ascii=False)
+        print(f"Saved CT-CSD diagnostics to {out_path}")
+
 
 def run_csv_eval(args):
+    is_local_hf_dataset_dir = os.path.isdir(args.csv_path) and os.path.exists(
+        os.path.join(args.csv_path, "dataset_dict.json")
+    )
+
     if 'TruthfulQA' in args.csv_path:
         dataset = load_dataset("domenicrosati/TruthfulQA", split="train")
         question_key = "Question"
@@ -653,7 +795,10 @@ def run_csv_eval(args):
             dataset = json.load(f)
         question_key = "refined_goal"
     elif 'AdvBench' in args.csv_path:
-        dataset = load_dataset("walledai/AdvBench", split="train")
+        if is_local_hf_dataset_dir:
+            dataset = load_from_disk(args.csv_path)["train"]
+        else:
+            dataset = load_dataset("walledai/AdvBench", split="train")
         question_key = "prompt"
     elif 'MATH' in args.csv_path:
         dataset = list(load_dataset("HuggingFaceH4/MATH-500")['test'])
@@ -675,6 +820,8 @@ def run_csv_eval(args):
         assert "prompt" in df.columns, "CSV must have a 'prompt' column"
         dataset = df.to_dict(orient="records")
         question_key = "prompt"
+
+    request_rows = None
 
     sampler = 'llada_dija' if args.attack_method == "DIJA" else args.sampler
 
@@ -727,10 +874,26 @@ def run_csv_eval(args):
             for i, row in enumerate(dataset)
         ]
     elif args.attack_method == 'prefix':
-        requests = [
-            Instance(request_type="generate_until", doc={}, arguments=(REFERENCES[0] + " " + row[question_key], {"until": []}), idx=i)
-            for i, row in enumerate(dataset)
-        ]
+        if getattr(args, "prefix_source", "references0") == "harmbench_human_jailbreaks":
+            prefixes = select_harmbench_prefix_templates(
+                load_harmbench_prefix_templates(),
+                random_subset=getattr(args, "prefix_random_subset", 5),
+                seed=getattr(args, "prefix_seed", 1),
+            )
+            request_rows = [
+                {"prompt": f"{prefix}\n\n{row[question_key]}"}
+                for row in dataset
+                for prefix in prefixes
+            ]
+            requests = [
+                Instance(request_type="generate_until", doc={}, arguments=(item["prompt"], {"until": []}), idx=i)
+                for i, item in enumerate(request_rows)
+            ]
+        else:
+            requests = [
+                Instance(request_type="generate_until", doc={}, arguments=(REFERENCES[0] + " " + row[question_key], {"until": []}), idx=i)
+                for i, row in enumerate(dataset)
+            ]
     else:
         requests = [
             Instance(request_type="generate_until", doc={}, arguments=(row[question_key], {"until": []}), idx=i)
@@ -739,12 +902,17 @@ def run_csv_eval(args):
 
     results = model.generate_until(requests)
 
-    out = [{"prompt": dataset[i][question_key], "response": r} for i, r in enumerate(results)]
+    if request_rows is not None:
+        out = [{"prompt": request_rows[i]["prompt"], "response": r} for i, r in enumerate(results)]
+    else:
+        out = [{"prompt": dataset[i][question_key], "response": r} for i, r in enumerate(results)]
     os.makedirs(args.generated_samples_path, exist_ok=True)
     out_path = os.path.join(args.generated_samples_path, "results.json")
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     print(f"Saved {len(out)} results to {out_path}")
+    if hasattr(model, "write_steering_diagnostics"):
+        model.write_steering_diagnostics()
 
 
 if __name__ == "__main__":
@@ -766,6 +934,9 @@ if __name__ == "__main__":
         full_parser.add_argument("--sampler", type=str, default="steering")
         full_parser.add_argument("--remdm_number", type=int, default=4)
         full_parser.add_argument("--attack_method", type=str, default="zeroshot", choices=["DIJA", "prefix", "PAP", "zeroshot"])
+        full_parser.add_argument("--prefix_source", type=str, default="references0", choices=["references0", "harmbench_human_jailbreaks"])
+        full_parser.add_argument("--prefix_random_subset", type=int, default=5)
+        full_parser.add_argument("--prefix_seed", type=int, default=1)
         full_parser.add_argument("--cfg", type=float, default=0.)
         full_parser.add_argument("--device", type=str, default="cuda")
         full_parser.add_argument("--self_reminder", type=str, default="False")
@@ -777,7 +948,7 @@ if __name__ == "__main__":
         full_parser.add_argument("--alignment_threshold", type=float, default=0.0,
                                  help="Per-token harmful direction projection threshold. "
                                       "Tokens with alignment above this are remasked and regenerated with adaptive steering.")
-        full_parser.add_argument("--max_refinement_iters", type=int, default=3,
+        full_parser.add_argument("--max_refinement_iters", type=int, default=5,
                                  help="Maximum number of remask-regenerate iterations per Phase 2 block.")
         full_parser.add_argument("--initial_steering_ratio", type=float, default=0.1,
                                  help="Fraction of Phase 1 steps that apply adaptive steering. "

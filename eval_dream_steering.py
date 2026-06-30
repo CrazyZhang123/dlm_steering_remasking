@@ -337,6 +337,8 @@ class DreamEvalHarness(LM):
 
     @torch.no_grad()
     def _extract_block_hidden(self, xt, block_start, block_end):
+        # 提取 block 区域 [block_start:block_end] 的隐藏状态
+        # 通过 forward hook 获取 target_layer 的输出，然后按 block 边界切片
         hidden_buffer = [None]
         def _extract_hook(module, input, output, _buf=hidden_buffer):
             h = output[0] if isinstance(output, tuple) else output
@@ -351,11 +353,19 @@ class DreamEvalHarness(LM):
 
     @torch.no_grad()
     def _per_token_alignment(self, block_hidden):
+        # 计算 block 内每个 token 的 hidden state 与 steering vector 的对齐程度
+        # 返回正值越大，表示该 token 语义越接近有害方向
         sv = self.steering_vector.to(block_hidden.device, dtype=block_hidden.dtype)
         sv_unit = sv / (sv.norm() + 1e-8)
         return (block_hidden * sv_unit).sum(dim=-1)
 
     def _build_adaptive_steering_hook(self, mask_index):
+        # 构建 adaptive steering forward hook
+        # 对 mask 位置的 hidden state 做 steering 修正：
+        #   - 先计算投影 a = hidden · sv_unit
+        #   - 如果 a > theta，则减去 alpha_t = beta * (a - theta) 倍的 sv_unit
+        #   - 如果 a <= theta，alpha_t = 0，不做扰动
+        # 核心思想：有害对齐强烈 → 引导力度强；有害对齐较弱 → 最小干预
         beta = self.steering_overshoot
         theta = self.alignment_threshold
         sv_ref = self.steering_vector
@@ -376,6 +386,8 @@ class DreamEvalHarness(LM):
 
     @torch.no_grad()
     def _refill_masks_with_steering(self, xt, block_end):
+        # Phase 2 辅助方法：对当前所有 mask 位置做一次 forward pass，
+        # 并用 adaptive steering 生成替换 token
         mask_index = (xt == self.mask_id)
         if not mask_index.any():
             return xt
@@ -396,6 +408,26 @@ class DreamEvalHarness(LM):
 
     @torch.no_grad()
     def dream_steering_sample(self, prompt):
+        # ==============================================================
+        # 两阶段安全生成：Adaptive Steering + Harmful Token Remasking
+        #
+        # Phase 1 (逐 block 解码):
+        #   - 将 mask_length 划分为 num_blocks 个 block
+        #   - 每个 block 内执行 steps 次 confidence-based 逐步解码
+        #   - 每次揭掉 confidence 最高的 k = mask_length / sampling_steps 个 token
+        #   - block 边界约束: x0_p[:, block_end:] = -np.inf，确保不跨 block
+        #   - 前 initial_steering_steps 步应用 adaptive steering hook
+        #
+        # Phase 2 (block 级安全检测 + remask):
+        #   - 一个 block 全部 steps 次迭代完成后才进入 Phase 2
+        #   - 提取 block 区域的 hidden states，计算 per-token alignment
+        #   - 将对齐超过 alignment_threshold 的 token 标记为有害
+        #   - 将有害 token 重新设回 mask_id，用 _refill_masks_with_steering 重新生成
+        #   - 最多重试 max_refinement_iters 次，直到 block 内无有害 token
+        #
+        # 不是每生成一个 token 就去检测安全，
+        # 而是等整个 block 的所有 token 解码完成后，才批量检测和 remask
+        # ==============================================================
         P = prompt.shape[1]
         if self.inject_prompt:
             total_len = P + P + self.mask_length
@@ -420,6 +452,7 @@ class DreamEvalHarness(LM):
         can_steer = (self.steering_vector is not None)
         initial_steering_steps = int(steps * self.initial_steering_ratio) if can_steer else 0
 
+        # ---- Phase 1: 逐 block 解码（confidence-based 逐步揭掩码） ----
         for num_block in range(num_blocks):
             block_start = prompt_len + num_block * self.block_size
             block_end = prompt_len + (num_block + 1) * self.block_size
@@ -427,6 +460,7 @@ class DreamEvalHarness(LM):
             for i in range(steps):
                 mask_index = (xt == self.mask_id)
 
+                # 前 initial_steering_steps 步可选的 adaptive steering
                 hook_handle = None
                 if can_steer and i < initial_steering_steps:
                     block_mask_index = mask_index.clone()
@@ -447,16 +481,19 @@ class DreamEvalHarness(LM):
                 x0 = _sample_categorical(p)
                 x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
 
+                # block 边界约束：只允许在 block 范围内产生新 token
                 x0_p[:, block_end:] = -np.inf
                 x0 = torch.where(mask_index, x0, xt)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
 
+                # 只揭掉 confidence 最高的 k 个 token
                 transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                 for j in range(confidence.shape[0]):
                     _, select_index = torch.topk(confidence[j], k=int(self.mask_length / self.sampling_steps))
                     transfer_index[j, select_index] = True
                 xt[transfer_index] = x0[transfer_index]
 
+            # ---- Phase 2: block 全部解码完成后，做安全检测 + remask ----
             if can_steer:
                 for refinement_iter in range(self.max_refinement_iters):
                     block_hidden = self._extract_block_hidden(xt, block_start, block_end)
@@ -554,6 +591,9 @@ class DreamEvalHarness(LM):
                 transfer_index[j, select_index] = True
             xt[transfer_index] = x0[transfer_index]
 
+        # ---- Phase 2 (DIJA): 全部解码完成后做 batch remask ----
+        # 不同于 block 模式按 block 做 remask，DIJA 对整个序列一次性检测+remask
+        # harmful_mask 用 original_mask_index 过滤，只对初始就是 mask 的位置做 remask
         if can_steer:
             for refinement_iter in range(self.max_refinement_iters):
                 hidden_buffer = [None]
