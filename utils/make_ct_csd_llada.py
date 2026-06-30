@@ -587,14 +587,21 @@ def knn_keep_decisions(
     keep_ratio: float,
     backend: str = "auto",
     metric: str = "cosine",
+    balanced: bool = False,
 ) -> torch.Tensor:
     """ENN 标签去噪投票：对前 n_harmful 个有害 token，返回 keep BoolTensor[n_harmful]。
 
     `features` 前 n_harmful 行为有害（标签 1），其余为安全（标签 0）。对每个有害 token 取最近
     k 个邻居（按 index 排除自身），若有害邻居占比 >= keep_ratio 则保留。极小数据集下若无可用
     邻居则保守保留。
+
+    balanced=False（默认）：标准 ENN，占比 = 有害邻居数 / 邻居总数。
+    balanced=True：per-class 加权投票，按全局池大小归一化票权，消除「有害 token 远多于安全
+    token」时多数类主导投票的偏置——
+        w_h = 有害邻居数 / N_h，w_s = 安全邻居数 / N_s，占比 = w_h / (w_h + w_s)。
     """
     n_total = int(features.shape[0])
+    n_safe = n_total - int(n_harmful)
     labels = torch.zeros(n_total, dtype=torch.int8)
     labels[:n_harmful] = 1
     k_query = min(int(k) + 1, n_total)
@@ -605,7 +612,14 @@ def knn_keep_decisions(
         if not nb:
             keep[i] = True
             continue
-        ratio = float((labels[nb] == 1).float().mean())
+        n_h_nb = int((labels[nb] == 1).sum())
+        n_s_nb = len(nb) - n_h_nb
+        if balanced:
+            w_h = (n_h_nb / n_harmful) if n_harmful > 0 else 0.0
+            w_s = (n_s_nb / n_safe) if n_safe > 0 else 0.0
+            ratio = (w_h / (w_h + w_s)) if (w_h + w_s) > 0 else 1.0
+        else:
+            ratio = float(n_h_nb) / len(nb)
         keep[i] = ratio >= float(keep_ratio)
     return keep
 
@@ -703,6 +717,7 @@ def build_knn_keep_masks(
         float(args.knn_keep_ratio),
         args.knn_backend,
         args.knn_metric,
+        bool(getattr(args, "knn_balanced", False)),
     )
 
     # ---- (4) 回写为按 position 有序的 BoolTensor + 诊断统计 ----
@@ -730,6 +745,7 @@ def build_knn_keep_masks(
         "knn_metric": str(args.knn_metric),
         "knn_backend": str(args.knn_backend),
         "knn_safe_pool_cap": int(getattr(args, "knn_safe_pool_cap", 0)),
+        "knn_balanced": bool(getattr(args, "knn_balanced", False)),
         "removed_top_terms": _knn_top_terms(tokenizer, removed_ids, 20),
         "kept_top_terms": _knn_top_terms(tokenizer, kept_ids, 20),
     }
@@ -1554,6 +1570,11 @@ def main(argv: list[str] | None = None) -> None:
         default=0,
         help="0 = 不限（用全部安全 token）；正整数 = 安全池下采样上限",
     )
+    parser.add_argument(
+        "--knn_balanced",
+        action="store_true",
+        help="per-class 加权投票，按全局池大小归一化票权，消除有害:安全 token 不平衡偏置",
+    )
     parser.add_argument("--coarse_direction_type", choices=["category", "global"], default="category")
     parser.add_argument("--min_coarse_tokens", type=int, default=1024)
     parser.add_argument("--feature_preprocess", choices=FEATURE_PREPROCESS_CHOICES, default="l2_only")
@@ -1723,6 +1744,7 @@ def main(argv: list[str] | None = None) -> None:
         state["config"]["knn_metric"] = str(args.knn_metric)
         state["config"]["knn_backend"] = str(args.knn_backend)
         state["config"]["knn_safe_pool_cap"] = int(args.knn_safe_pool_cap)
+        state["config"]["knn_balanced"] = bool(args.knn_balanced)
         state["config"]["knn_retention_ratio"] = float(knn_stats.get("retention", 0.0))
     if is_probe_method:
         state["config"]["token_selection"] = "mil_probe_threshold"

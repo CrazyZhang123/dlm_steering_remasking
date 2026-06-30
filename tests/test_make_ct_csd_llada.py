@@ -1393,6 +1393,43 @@ class KnnLabelCleanTest(unittest.TestCase):
         self.assertTrue(bool(keep_low[3]))
         self.assertFalse(bool(keep_high[3]))
 
+    def _imbalanced_pool(self):
+        # 7 纯有害(x+) + 1 功能词有害(靠安全簇, idx7) + 2 安全(x-)；N_h=8 : N_s=2 = 4:1 不平衡
+        features = torch.tensor(
+            [
+                [1.0, 0.0], [0.95, 0.05], [0.9, 0.1], [0.92, 0.0],
+                [0.97, 0.03], [0.88, 0.12], [0.91, 0.06],
+                [-0.8, 0.2],
+                [-1.0, 0.0], [-0.95, 0.05],
+            ]
+        )
+        return features, 8
+
+    def test_knn_balanced_corrects_majority_class_bias(self):
+        features, n_h = self._imbalanced_pool()
+        std = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.5, backend="sklearn", balanced=False)
+        bal = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.5, backend="sklearn", balanced=True)
+        # 多数类(有害)主导下，标准投票保留靠安全簇的功能词；per-class 加权将其剔除
+        self.assertTrue(bool(std[7]))
+        self.assertFalse(bool(bal[7]))
+        # 纯有害 token 在两种模式下都保留
+        self.assertTrue(bool(std[:7].all()))
+        self.assertTrue(bool(bal[:7].all()))
+
+    def test_knn_balanced_default_false_matches_explicit_standard(self):
+        features, n_h = self._imbalanced_pool()
+        default = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.5, backend="sklearn")
+        explicit = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.5, backend="sklearn", balanced=False)
+        self.assertTrue(torch.equal(default, explicit))
+
+    def test_knn_balanced_all_harmful_keeps_all(self):
+        # 安全池为空(n_safe=0)：balanced 分支 w_s=0 → ratio=1.0，退化为全部保留，且不除零
+        features = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.95, 0.05]])
+        keep = builder.knn_keep_decisions(
+            features, n_harmful=3, k=2, keep_ratio=0.5, backend="sklearn", balanced=True
+        )
+        self.assertTrue(bool(keep.all()))
+
     def test_knn_nearest_indices_auto_falls_back_to_sklearn(self):
         features, n_h = self._toy_pool()
         with patch.object(builder, "_faiss_available", return_value=False):
@@ -1436,6 +1473,7 @@ class KnnLabelCleanTest(unittest.TestCase):
             knn_metric="cosine",
             knn_backend="sklearn",
             knn_safe_pool_cap=0,
+            knn_balanced=False,
         )
 
     def test_build_knn_keep_masks_does_not_consume_global_rng(self):
@@ -1506,6 +1544,7 @@ class KnnLabelCleanTest(unittest.TestCase):
                 "knn_metric": str(args.knn_metric),
                 "knn_backend": str(args.knn_backend),
                 "knn_safe_pool_cap": int(args.knn_safe_pool_cap),
+                "knn_balanced": bool(getattr(args, "knn_balanced", False)),
                 "removed_top_terms": [],
                 "kept_top_terms": [],
             }
@@ -1555,6 +1594,7 @@ class KnnLabelCleanTest(unittest.TestCase):
                         "--knn_keep_ratio", "0.5",
                         "--knn_metric", "cosine",
                         "--knn_backend", "sklearn",
+                        "--knn_balanced",
                         "--feature_preprocess", "center_pca128_l2",
                     ]
                 )
@@ -1569,8 +1609,10 @@ class KnnLabelCleanTest(unittest.TestCase):
         self.assertEqual(state["config"]["knn_metric"], "cosine")
         self.assertEqual(state["config"]["knn_backend"], "sklearn")
         self.assertEqual(state["config"]["knn_retention_ratio"], 0.5)
+        self.assertTrue(state["config"]["knn_balanced"])
         self.assertEqual(summary["total_harmful_tokens"], 2)
         self.assertFalse(summary["degenerate"])
+        self.assertTrue(summary["knn_balanced"])
 
 
 if __name__ == "__main__":
