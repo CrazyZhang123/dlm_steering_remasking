@@ -95,16 +95,27 @@ class _NearestAxisKMeans:
         return [0 if row[0] > row[1] else 1 for row in features]
 
 
+class _RecordingKMeans:
+    def __init__(self):
+        self.predicted_features = None
+
+    def predict(self, features):
+        self.predicted_features = features.copy()
+        return [0 if row[0] >= row[1] else 1 for row in features]
+
+
 class _RecordingCategoryKMeans:
     def __init__(self, category):
         self.category = category
         self.partial_fit_batches = []
+        self.predicted_features = None
 
     def partial_fit(self, features):
         self.partial_fit_batches.append(features.copy())
         return self
 
     def predict(self, features):
+        self.predicted_features = features.copy()
         if self.category == "fraud":
             return [0 for _row in features]
         return [0 if row[0] >= row[1] else 1 for row in features]
@@ -171,6 +182,67 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertTrue(torch.equal(kept_ids, torch.tensor([6, 7])))
         self.assertTrue(torch.equal(kept_scores, torch.tensor([0.7, 0.9])))
 
+    def test_top_ratio_select_caps_ceil_ratio_and_keeps_token_alignment(self):
+        hidden = torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, 4.0]])
+        token_ids = torch.tensor([11, 12, 13, 14])
+        scores = torch.tensor([0.2, 0.9, 0.8, 0.1])
+
+        selected_hidden, selected_ids, selected_scores, selected_mask = builder.top_ratio_select(
+            hidden,
+            token_ids,
+            scores,
+            ratio=0.75,
+            max_selected_tokens=2,
+        )
+
+        self.assertTrue(torch.equal(selected_hidden, torch.tensor([[0.0, 2.0], [3.0, 0.0]])))
+        self.assertTrue(torch.equal(selected_ids, torch.tensor([12, 13])))
+        self.assertTrue(torch.equal(selected_scores, torch.tensor([0.9, 0.8])))
+        self.assertEqual(selected_mask.tolist(), [False, True, True, False])
+
+    def test_direction_top_ratio_selects_tokens_by_category_direction_with_global_fallback(self):
+        hidden = torch.tensor([[0.0, 3.0], [4.0, 0.0], [1.0, 0.0]])
+        token_ids = torch.tensor([21, 22, 23])
+        args = SimpleNamespace(
+            token_selection="direction_top_ratio",
+            selection_ratio=0.34,
+            max_selected_tokens=2,
+            category_key="semantic_category",
+            coarse_direction_type="category",
+            min_coarse_tokens=2,
+            coarse_directions_by_category={"illegal": torch.tensor([1.0, 0.0])},
+            coarse_direction_token_counts={"illegal": 1},
+            global_coarse_direction=torch.tensor([0.0, 1.0]),
+        )
+
+        selected_hidden, selected_ids = builder.select_harmful_response_tokens(
+            hidden,
+            token_ids,
+            {"semantic_category": "illegal"},
+            args,
+        )
+
+        self.assertTrue(torch.equal(selected_hidden, torch.tensor([[0.0, 3.0], [4.0, 0.0]])))
+        self.assertTrue(torch.equal(selected_ids, torch.tensor([21, 22])))
+
+    def test_random_top_ratio_is_deterministic_per_sample_index(self):
+        hidden = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+        token_ids = torch.tensor([31, 32, 33, 34, 35])
+        args = SimpleNamespace(
+            token_selection="random_top_ratio",
+            selection_ratio=0.4,
+            max_selected_tokens=4,
+            seed=123,
+            _sample_index=7,
+        )
+
+        first_hidden, first_ids = builder.select_harmful_response_tokens(hidden, token_ids, {}, args)
+        second_hidden, second_ids = builder.select_harmful_response_tokens(hidden, token_ids, {}, args)
+
+        self.assertEqual(first_ids.tolist(), second_ids.tolist())
+        self.assertEqual(first_ids.numel(), 2)
+        self.assertTrue(torch.equal(first_hidden, hidden[torch.isin(token_ids, first_ids)]))
+
     def test_extract_target_layer_tokens_uses_hook_and_slices_response(self):
         hidden = torch.tensor([[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]])
         model = _HookModel(hidden)
@@ -217,6 +289,178 @@ class BuilderHelpersTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(h_tokens, torch.tensor([[1.0, 0.0], [0.0, 3.0]])))
         self.assertTrue(torch.equal(safe_mean, torch.tensor([5.0, 15.0])))
+
+    def test_transform_route_features_centers_projects_and_normalizes(self):
+        preprocess = {
+            "mode": "center_pca128_l2",
+            "mean": torch.tensor([1.0, 1.0, 1.0]),
+            "pca_components": torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            "pca_dim": 2,
+        }
+        hidden = torch.tensor([[2.0, 1.0, 1.0], [1.0, 3.0, 1.0]])
+
+        features = builder.transform_route_features(hidden, preprocess)
+
+        self.assertTrue(torch.allclose(features, torch.tensor([[1.0, 0.0], [0.0, 1.0]]), atol=1e-6))
+
+    def test_fit_route_preprocess_uses_selected_harmful_and_safe_response_tokens(self):
+        args = SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            feature_preprocess="center_l2",
+            pca_dim=128,
+            token_selection="direction_top_ratio",
+            selection_ratio=0.5,
+            max_selected_tokens=1,
+            category_key="semantic_category",
+            coarse_direction_type="global",
+            min_coarse_tokens=1,
+            global_coarse_direction=torch.tensor([1.0, 0.0]),
+        )
+        h_raw = torch.tensor([[10.0, 0.0], [0.0, 2.0], [1.0, 0.0], [88.0, 88.0]])
+        s_raw = torch.tensor([[0.0, 4.0], [0.0, 6.0], [0.0, 6.0], [88.0, 88.0]])
+
+        with patch.object(builder.random, "choice", return_value="refusal1"):
+            with patch.object(builder, "extract_target_layer_tokens", side_effect=[h_raw, s_raw]):
+                preprocess, skipped = builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    [{"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"}],
+                    ["refusal1"],
+                    args,
+                    torch.device("cpu"),
+                )
+
+        self.assertEqual(skipped, 0)
+        self.assertEqual(preprocess["mode"], "center_l2")
+        self.assertTrue(torch.allclose(preprocess["mean"], torch.tensor([10.0 / 3.0, 10.0 / 3.0])))
+
+    def test_fit_route_preprocess_pca_avoids_full_svd(self):
+        args = SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            feature_preprocess="center_pca128_l2",
+            pca_dim=128,
+            token_selection="all",
+            selection_ratio=1.0,
+            max_selected_tokens=32,
+            category_key="semantic_category",
+            seed=42,
+        )
+        samples = [{"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"}]
+
+        with patch.object(
+            builder,
+            "extract_sample_response_tokens",
+            return_value=(
+                torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+                torch.tensor([3, 6]),
+                torch.tensor([[1.0, 1.0]]),
+            ),
+        ):
+            with patch.object(builder.torch.linalg, "svd", side_effect=AssertionError("full SVD should not be used")):
+                preprocess, skipped = builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    args,
+                    torch.device("cpu"),
+                )
+
+        self.assertEqual(skipped, 0)
+        self.assertEqual(preprocess["mode"], "center_pca128_l2")
+        self.assertEqual(preprocess["pca_dim"], 2)
+        self.assertEqual(preprocess["requested_pca_dim"], 128)
+        self.assertEqual(preprocess["pca_components"].shape, (2, 2))
+
+    def test_extra_direction_and_preprocess_passes_do_not_consume_global_refusal_rng(self):
+        args = SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            feature_preprocess="center_l2",
+            pca_dim=128,
+            token_selection="all",
+            selection_ratio=1.0,
+            max_selected_tokens=32,
+            category_key="semantic_category",
+            seed=42,
+        )
+        samples = [{"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"}]
+        with patch.object(
+            builder,
+            "extract_sample_response_tokens",
+            return_value=(
+                torch.tensor([[1.0, 0.0]]),
+                torch.tensor([3]),
+                torch.tensor([[0.0, 1.0]]),
+            ),
+        ):
+            with patch.object(builder.random, "choice", side_effect=AssertionError("global RNG consumed")):
+                _directions, _counts, _global_direction, skipped_direction = builder.fit_coarse_directions(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    args,
+                    torch.device("cpu"),
+                )
+                _preprocess, skipped_preprocess = builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    args,
+                    torch.device("cpu"),
+                )
+
+        self.assertEqual(skipped_direction, 0)
+        self.assertEqual(skipped_preprocess, 0)
+
+    def test_fit_coarse_directions_uses_sample_balanced_safe_mean(self):
+        args = SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            category_key="semantic_category",
+            seed=42,
+        )
+        samples = [
+            {"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"},
+            {"prompt": "prompt", "response": "harmful2", "semantic_category": "illegal"},
+        ]
+        with patch.object(
+            builder,
+            "extract_sample_response_tokens",
+            side_effect=[
+                (
+                    torch.tensor([[10.0, 0.0], [10.0, 0.0]]),
+                    torch.tensor([3, 6]),
+                    torch.tensor([[0.0, 2.0]]),
+                ),
+                (
+                    torch.tensor([[20.0, 0.0], [20.0, 0.0]]),
+                    torch.tensor([3, 6]),
+                    torch.tensor([[0.0, 10.0], [0.0, 10.0], [0.0, 10.0]]),
+                ),
+            ],
+        ):
+            directions, counts, global_direction, skipped = builder.fit_coarse_directions(
+                _Model(),
+                _SequenceTokenizer(),
+                samples,
+                ["refusal1"],
+                args,
+                torch.device("cpu"),
+            )
+
+        self.assertEqual(skipped, 0)
+        self.assertEqual(counts, {"illegal": 4})
+        self.assertTrue(torch.allclose(directions["illegal"], torch.tensor([15.0, -6.0])))
+        self.assertTrue(torch.allclose(global_direction, torch.tensor([15.0, -6.0])))
 
     def test_fit_minibatch_kmeans_uses_filtered_sample_balanced_safe_mean(self):
         args = SimpleNamespace(
@@ -278,6 +522,37 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertTrue(torch.equal(cluster_sums, torch.tensor([[4.0, 0.0], [0.0, 6.0]])))
         self.assertEqual(cluster_counts.tolist(), [2, 2])
 
+    def test_accumulate_cluster_sums_predicts_with_route_features_but_sums_raw_hidden(self):
+        args = SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            num_total_clusters=2,
+            route_preprocess={
+                "mode": "center_l2",
+                "mean": torch.tensor([1.0, 1.0]),
+            },
+        )
+        h_tokens = torch.tensor([[3.0, 1.0], [1.0, 4.0]])
+        kmeans = _RecordingKMeans()
+
+        with patch.object(builder.random, "choice", return_value="refusal1"):
+            with patch.object(builder, "iter_valid_sample_tokens", return_value=(h_tokens, torch.zeros(2))):
+                cluster_sums, cluster_counts, skipped = builder.accumulate_cluster_sums(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    [{"prompt": "prompt", "response": "harmful1"}],
+                    ["refusal1"],
+                    kmeans,
+                    args,
+                    torch.device("cpu"),
+                )
+
+        self.assertEqual(skipped, 0)
+        self.assertTrue(torch.allclose(torch.tensor(kmeans.predicted_features), torch.eye(2), atol=1e-6))
+        self.assertTrue(torch.equal(cluster_sums, torch.tensor([[3.0, 1.0], [1.0, 4.0]])))
+        self.assertEqual(cluster_counts.tolist(), [1, 1])
+
     def test_main_writes_ct_csd_bank_with_cli_metadata(self):
         class _LoadableModel(_Model):
             def to(self, device):
@@ -303,46 +578,73 @@ class BuilderHelpersTest(unittest.TestCase):
                 with patch.object(builder.AutoModel, "from_pretrained", return_value=_LoadableModel()):
                     with patch.object(
                         builder,
-                        "fit_minibatch_kmeans",
-                        return_value=(object(), torch.tensor([0.5, 0.5]), 1),
-                    ) as fit_mock:
+                        "fit_coarse_directions",
+                        return_value=({}, {}, torch.tensor([1.0, 0.0]), 0),
+                    ):
                         with patch.object(
                             builder,
-                            "accumulate_cluster_sums",
+                            "fit_route_preprocess",
                             return_value=(
-                                torch.tensor([[2.0, 0.0], [0.0, 6.0]]),
-                                torch.tensor([2, 3]),
+                                {
+                                    "mode": "center_pca128_l2",
+                                    "mean": torch.zeros(2),
+                                    "pca_components": torch.eye(2),
+                                    "pca_dim": 2,
+                                    "requested_pca_dim": 128,
+                                },
                                 0,
                             ),
-                        ) as accumulate_mock:
-                            builder.main(
-                                [
-                                    "--model_path",
-                                    "dummy-model",
-                                    "--harmful_json",
-                                    str(harmful_path),
-                                    "--refusals_txt",
-                                    str(refusals_path),
-                                    "--output_dir",
-                                    str(output_dir),
-                                    "--target_layer",
-                                    "31",
-                                    "--max_response_len",
-                                    "128",
-                                    "--max_total_len",
-                                    "2048",
-                                    "--method",
-                                    "ct_csd",
-                                    "--num_total_clusters",
-                                    "2",
-                                    "--kmeans_batch_size",
-                                    "16",
-                                    "--device",
-                                    "cpu",
-                                    "--seed",
-                                    "42",
-                                ]
-                            )
+                        ):
+                            with patch.object(
+                                builder,
+                                "fit_minibatch_kmeans",
+                                return_value=(object(), torch.tensor([0.5, 0.5]), 1),
+                            ) as fit_mock:
+                                with patch.object(
+                                    builder,
+                                    "accumulate_cluster_sums",
+                                    return_value=(
+                                        torch.tensor([[2.0, 0.0], [0.0, 6.0]]),
+                                        torch.tensor([2, 3]),
+                                        0,
+                                    ),
+                                ) as accumulate_mock:
+                                    builder.main(
+                                        [
+                                            "--model_path",
+                                            "dummy-model",
+                                            "--harmful_json",
+                                            str(harmful_path),
+                                            "--refusals_txt",
+                                            str(refusals_path),
+                                            "--output_dir",
+                                            str(output_dir),
+                                            "--target_layer",
+                                            "31",
+                                            "--max_response_len",
+                                            "128",
+                                            "--max_total_len",
+                                            "2048",
+                                            "--method",
+                                            "ct_csd",
+                                            "--num_total_clusters",
+                                            "2",
+                                            "--kmeans_batch_size",
+                                            "16",
+                                            "--device",
+                                            "cpu",
+                                            "--seed",
+                                            "42",
+                                            "--token_selection",
+                                            "direction_top_ratio",
+                                            "--selection_ratio",
+                                            "0.3",
+                                            "--max_selected_tokens",
+                                            "32",
+                                            "--feature_preprocess",
+                                            "center_pca128_l2",
+                                        ]
+                                    )
 
             out_path = output_dir / "ct_csd_bank.pt"
             state = torch.load(out_path, map_location="cpu", weights_only=True)
@@ -358,6 +660,17 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertEqual(state["config"]["skipped_pass1"], 1)
         self.assertEqual(state["config"]["skipped_pass2"], 0)
         self.assertEqual(state["config"]["seed"], 42)
+        self.assertEqual(state["config"]["model_path"], "dummy-model")
+        self.assertEqual(state["config"]["max_samples"], None)
+        self.assertEqual(state["config"]["kmeans_batch_size"], 16)
+        self.assertEqual(state["config"]["token_selection"], "direction_top_ratio")
+        self.assertEqual(state["config"]["selection_ratio"], 0.3)
+        self.assertEqual(state["config"]["max_selected_tokens"], 32)
+        self.assertEqual(state["config"]["feature_preprocess"], "center_pca128_l2")
+        self.assertEqual(state["config"]["pca_dim"], 2)
+        self.assertEqual(state["config"]["requested_pca_dim"], 128)
+        self.assertEqual(state["preprocess"]["mode"], "center_pca128_l2")
+        self.assertIn("route_centers", state)
 
     def test_main_writes_probe_ct_csd_bank_with_mil_metadata(self):
         class _LoadableModel(_Model):
@@ -492,6 +805,29 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertEqual(state["cluster_sizes"].tolist(), [3, 2])
         self.assertEqual(state["config"]["method"], "ct_csd")
         self.assertEqual(state["config"]["num_total_clusters"], 2)
+
+    def test_build_state_from_cluster_sums_saves_preprocess_and_route_centers(self):
+        safe_mean = torch.tensor([0.5, 0.5])
+        cluster_sums = torch.tensor([[3.0, 0.0], [0.0, 6.0]])
+        cluster_counts = torch.tensor([3, 2])
+        route_preprocess = {"mode": "center_l2", "mean": torch.tensor([1.0, 1.0])}
+
+        state = builder.build_bank_state_from_cluster_sums(
+            safe_mean=safe_mean,
+            cluster_sums=cluster_sums,
+            cluster_counts=cluster_counts,
+            target_layer=31,
+            max_response_len=128,
+            num_total_clusters=2,
+            route_preprocess=route_preprocess,
+            route_centers=torch.tensor([[2.0, 0.0], [0.0, 4.0]]),
+        )
+
+        self.assertTrue(torch.equal(state["raw_centers"], state["centers"]))
+        self.assertEqual(state["preprocess"]["mode"], "center_l2")
+        self.assertTrue(torch.equal(state["preprocess"]["mean"], torch.tensor([1.0, 1.0])))
+        self.assertTrue(torch.allclose(state["route_centers"], torch.tensor([[1.0, 0.0], [0.0, 1.0]])))
+        self.assertEqual(state["config"]["feature_preprocess"], "center_l2")
 
     def test_resolve_category_prefers_requested_key_then_fallbacks(self):
         sample = {
@@ -630,6 +966,42 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertEqual(sorted(kmeans_by_category), ["fraud", "illegal"])
         self.assertEqual(len(kmeans_by_category["illegal"].partial_fit_batches), 1)
         self.assertEqual(len(kmeans_by_category["fraud"].partial_fit_batches), 1)
+
+    def test_fit_category_minibatch_kmeans_uses_route_features(self):
+        args = SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            num_total_clusters=2,
+            kmeans_batch_size=16,
+            seed=42,
+            category_key="semantic_category",
+            route_preprocess={"mode": "center_l2", "mean": torch.tensor([1.0, 1.0])},
+        )
+        plan = {
+            "categories": ["illegal"],
+            "category_token_counts": {"illegal": 2},
+            "category_cluster_counts": {"illegal": 1},
+            "raw_to_center_category": {"illegal": "illegal"},
+        }
+        h_tokens = torch.tensor([[3.0, 1.0], [1.0, 4.0]])
+
+        with patch.object(builder.random, "choice", return_value="refusal1"):
+            with patch.object(builder, "iter_valid_sample_tokens", return_value=(h_tokens, torch.zeros(2))):
+                kmeans_by_category, _safe_mean, skipped = builder.fit_category_minibatch_kmeans(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    [{"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"}],
+                    ["refusal1"],
+                    args,
+                    torch.device("cpu"),
+                    plan,
+                    kmeans_factory=lambda category, n_clusters: _RecordingCategoryKMeans(category),
+                )
+
+        self.assertEqual(skipped, 0)
+        batch = torch.tensor(kmeans_by_category["illegal"].partial_fit_batches[0])
+        self.assertTrue(torch.allclose(batch, torch.eye(2), atol=1e-6))
 
     def test_accumulate_category_cluster_sums_uses_global_offsets(self):
         args = SimpleNamespace(
@@ -910,8 +1282,63 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertEqual(summary["method"], "category_ct_csd")
         self.assertEqual(summary["num_total_clusters"], 2)
         self.assertEqual(summary["cluster_sizes"], [2, 3])
+        self.assertEqual(summary["token_selection"], None)
+        self.assertEqual(summary["feature_preprocess"], None)
+        self.assertEqual(summary["requested_pca_dim"], None)
         self.assertIn("| fraud | 0 | 2 |", markdown)
         self.assertIn("| illegal | 0 | 3 |", markdown)
+
+    def test_write_bank_summary_outputs_stage6_selection_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            state = {
+                "config": {
+                    "method": "ct_csd",
+                    "num_total_clusters": 2,
+                    "token_selection": "direction_top_ratio",
+                    "selection_ratio": 0.3,
+                    "max_selected_tokens": 32,
+                    "coarse_direction_type": "category",
+                    "min_coarse_tokens": 1024,
+                    "feature_preprocess": "center_pca128_l2",
+                    "pca_dim": 2,
+                    "requested_pca_dim": 128,
+                    "harmful_json": "harmful.json",
+                    "refusals_txt": "refusals.txt",
+                    "model_path": "dummy-model",
+                    "max_samples": 64,
+                    "kmeans_batch_size": 16,
+                    "skipped_pass1": 1,
+                    "skipped_pass2": 2,
+                    "skipped_coarse_direction": 3,
+                    "skipped_preprocess": 4,
+                    "seed": 42,
+                },
+                "cluster_sizes": torch.tensor([2, 3]),
+            }
+
+            builder.write_bank_summary(output_dir, state)
+
+            summary = json.loads((output_dir / "ct_csd_bank_summary.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["token_selection"], "direction_top_ratio")
+        self.assertEqual(summary["selection_ratio"], 0.3)
+        self.assertEqual(summary["max_selected_tokens"], 32)
+        self.assertEqual(summary["coarse_direction_type"], "category")
+        self.assertEqual(summary["min_coarse_tokens"], 1024)
+        self.assertEqual(summary["feature_preprocess"], "center_pca128_l2")
+        self.assertEqual(summary["pca_dim"], 2)
+        self.assertEqual(summary["requested_pca_dim"], 128)
+        self.assertEqual(summary["harmful_json"], "harmful.json")
+        self.assertEqual(summary["refusals_txt"], "refusals.txt")
+        self.assertEqual(summary["model_path"], "dummy-model")
+        self.assertEqual(summary["max_samples"], 64)
+        self.assertEqual(summary["kmeans_batch_size"], 16)
+        self.assertEqual(summary["skipped_pass1"], 1)
+        self.assertEqual(summary["skipped_pass2"], 2)
+        self.assertEqual(summary["skipped_coarse_direction"], 3)
+        self.assertEqual(summary["skipped_preprocess"], 4)
+        self.assertEqual(summary["seed"], 42)
 
     def test_write_probe_diagnostics_outputs_summary_and_high_score_tokens(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -943,6 +1370,207 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertEqual(summary["per_category_tokens_before_probe"], {"illegal": 2})
         self.assertEqual(summary["per_category_tokens_after_probe"], {"illegal": 1})
         self.assertIn("| illegal | word | 0.900000 | yes |", markdown)
+
+
+class KnnLabelCleanTest(unittest.TestCase):
+    def _toy_pool(self):
+        # 前 4 行为有害：3 个纯有害（x 轴正向）+ 1 个边界有害（落入安全簇）；后 3 行为安全（x 轴负向）。
+        harmful = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.95, 0.05], [-0.9, 0.1]])
+        safe = torch.tensor([[-1.0, 0.0], [-0.95, 0.05], [-0.92, 0.08]])
+        return torch.cat([harmful, safe], dim=0), 4
+
+    def test_knn_keep_decisions_removes_boundary_token(self):
+        features, n_h = self._toy_pool()
+        keep = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.5, backend="sklearn", metric="cosine")
+        self.assertTrue(bool(keep[:3].all()))  # 纯有害 token 邻居多为有害 → 保留
+        self.assertFalse(bool(keep[3]))  # 边界有害 token 邻居多为安全 → 剔除
+
+    def test_knn_keep_decisions_threshold_controls_retention(self):
+        features, n_h = self._toy_pool()
+        keep_low = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.2, backend="sklearn", metric="cosine")
+        keep_high = builder.knn_keep_decisions(features, n_h, k=4, keep_ratio=0.5, backend="sklearn", metric="cosine")
+        # 边界 token 有害邻居占比约 0.25：阈值 0.2 保留，阈值 0.5 剔除
+        self.assertTrue(bool(keep_low[3]))
+        self.assertFalse(bool(keep_high[3]))
+
+    def test_knn_nearest_indices_auto_falls_back_to_sklearn(self):
+        features, n_h = self._toy_pool()
+        with patch.object(builder, "_faiss_available", return_value=False):
+            idx_auto = builder._knn_nearest_indices(features, n_h, k=3, backend="auto", metric="cosine")
+        idx_sklearn = builder._knn_nearest_indices(features, n_h, k=3, backend="sklearn", metric="cosine")
+        self.assertEqual(tuple(idx_auto.shape), (n_h, 3))
+        self.assertTrue(torch.equal(idx_auto, idx_sklearn))
+
+    def test_select_knn_label_clean_equivalent_to_all_when_cache_missing(self):
+        args = SimpleNamespace(token_selection="knn_label_clean", _sample_index=0)
+        hidden = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+        token_ids = torch.tensor([3, 4, 6])
+        out_hidden, out_ids = builder.select_harmful_response_tokens(hidden, token_ids, {}, args)
+        self.assertTrue(torch.equal(out_hidden, hidden))
+        self.assertTrue(torch.equal(out_ids, token_ids))
+
+    def test_select_knn_label_clean_applies_mask_and_detects_misalignment(self):
+        hidden = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+        token_ids = torch.tensor([3, 4, 6])
+        args = SimpleNamespace(
+            token_selection="knn_label_clean",
+            _sample_index=0,
+            _knn_keep_masks={0: torch.tensor([True, False, True])},
+        )
+        out_hidden, out_ids = builder.select_harmful_response_tokens(hidden, token_ids, {}, args)
+        self.assertTrue(torch.equal(out_hidden, torch.tensor([[1.0, 1.0], [3.0, 3.0]])))
+        self.assertTrue(torch.equal(out_ids, torch.tensor([3, 6])))
+        # mask 与 token 序列长度不一致时必须报错，不得静默错位
+        args._knn_keep_masks = {0: torch.tensor([True, False])}
+        with self.assertRaises(RuntimeError):
+            builder.select_harmful_response_tokens(hidden, token_ids, {}, args)
+
+    def _knn_build_args(self):
+        return SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            seed=42,
+            knn_k=2,
+            knn_keep_ratio=0.5,
+            knn_metric="cosine",
+            knn_backend="sklearn",
+            knn_safe_pool_cap=0,
+        )
+
+    def test_build_knn_keep_masks_does_not_consume_global_rng(self):
+        args = self._knn_build_args()
+        samples = [
+            {"prompt": "prompt", "response": "harmful1"},
+            {"prompt": "prompt", "response": "harmful2"},
+        ]
+        with patch.object(builder, "extract_target_layer_tokens", return_value=torch.zeros(4, 2)), patch.object(
+            builder, "filter_response_tokens", return_value=(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), torch.tensor([3, 6]))
+        ), patch.object(
+            builder, "filter_response_hidden_states", return_value=torch.tensor([[-1.0, 0.0], [0.0, -1.0]])
+        ), patch.object(
+            builder.random, "choice", side_effect=AssertionError("global RNG consumed")
+        ):
+            masks = builder.build_knn_keep_masks(
+                _Model(), _SequenceTokenizer(), samples, ["refusal1"], args, torch.device("cpu")
+            )
+        self.assertEqual(set(masks.keys()), {0, 1})
+
+    def test_build_knn_keep_masks_aligns_masks_by_sample(self):
+        args = self._knn_build_args()
+        samples = [
+            {"prompt": "prompt", "response": "harmful1"},
+            {"prompt": "prompt", "response": "harmful2"},
+        ]
+        with patch.object(builder, "extract_target_layer_tokens", return_value=torch.zeros(4, 2)), patch.object(
+            builder, "filter_response_tokens", return_value=(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), torch.tensor([3, 6]))
+        ), patch.object(
+            builder, "filter_response_hidden_states", return_value=torch.tensor([[-1.0, 0.0], [0.0, -1.0]])
+        ):
+            masks = builder.build_knn_keep_masks(
+                _Model(), _SequenceTokenizer(), samples, ["refusal1"], args, torch.device("cpu")
+            )
+        # 每个样本的 mask 长度 == 过滤后有害 token 数（2），可被 select 无错位应用
+        for idx in (0, 1):
+            self.assertEqual(int(masks[idx].shape[0]), 2)
+            apply_args = SimpleNamespace(
+                token_selection="knn_label_clean", _sample_index=idx, _knn_keep_masks=masks
+            )
+            builder.select_harmful_response_tokens(
+                torch.zeros(2, 2), torch.tensor([3, 6]), {}, apply_args
+            )
+        # 诊断统计已写入 args
+        self.assertEqual(args._knn_stats["total_harmful_tokens"], 4)
+        self.assertIn("retention", args._knn_stats)
+
+    def test_main_writes_knn_ct_csd_bank_with_cli_metadata(self):
+        class _LoadableModel(_Model):
+            def to(self, device):
+                self.device = device
+                return self
+
+            def eval(self):
+                self.is_eval = True
+                return self
+
+        def fake_build(model, tokenizer, harmful, refusals, args, device):
+            args._knn_stats = {
+                "total_harmful_tokens": 2,
+                "kept_harmful_tokens": 1,
+                "removed_harmful_tokens": 1,
+                "retention": 0.5,
+                "safe_pool_tokens": 2,
+                "degenerate": False,
+                "knn_k": int(args.knn_k),
+                "knn_keep_ratio": float(args.knn_keep_ratio),
+                "knn_metric": str(args.knn_metric),
+                "knn_backend": str(args.knn_backend),
+                "knn_safe_pool_cap": int(args.knn_safe_pool_cap),
+                "removed_top_terms": [],
+                "kept_top_terms": [],
+            }
+            return {0: torch.tensor([True, False])}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            harmful_path = root / "harmful.json"
+            refusals_path = root / "refusals.txt"
+            output_dir = root / "out"
+            harmful_path.write_text('[{"prompt": "prompt", "response": "harmful1"}]', encoding="utf-8")
+            refusals_path.write_text("refusal1\n", encoding="utf-8")
+
+            with patch.object(builder.AutoTokenizer, "from_pretrained", return_value=_SequenceTokenizer()), patch.object(
+                builder.AutoModel, "from_pretrained", return_value=_LoadableModel()
+            ), patch.object(
+                builder,
+                "fit_route_preprocess",
+                return_value=(
+                    {
+                        "mode": "center_pca128_l2",
+                        "mean": torch.zeros(2),
+                        "pca_components": torch.eye(2),
+                        "pca_dim": 2,
+                        "requested_pca_dim": 128,
+                    },
+                    0,
+                ),
+            ), patch.object(builder, "build_knn_keep_masks", side_effect=fake_build) as build_mock, patch.object(
+                builder, "fit_minibatch_kmeans", return_value=(object(), torch.tensor([0.5, 0.5]), 0)
+            ), patch.object(
+                builder,
+                "accumulate_cluster_sums",
+                return_value=(torch.tensor([[2.0, 0.0], [0.0, 6.0]]), torch.tensor([2, 3]), 0),
+            ):
+                builder.main(
+                    [
+                        "--model_path", "dummy-model",
+                        "--harmful_json", str(harmful_path),
+                        "--refusals_txt", str(refusals_path),
+                        "--output_dir", str(output_dir),
+                        "--method", "ct_csd",
+                        "--num_total_clusters", "2",
+                        "--device", "cpu",
+                        "--token_selection", "knn_label_clean",
+                        "--knn_k", "6",
+                        "--knn_keep_ratio", "0.5",
+                        "--knn_metric", "cosine",
+                        "--knn_backend", "sklearn",
+                        "--feature_preprocess", "center_pca128_l2",
+                    ]
+                )
+
+            state = torch.load(output_dir / "ct_csd_bank.pt", map_location="cpu", weights_only=True)
+            summary = json.loads((output_dir / "knn_label_clean_summary.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(build_mock.called)
+        self.assertEqual(state["config"]["token_selection"], "knn_label_clean")
+        self.assertEqual(state["config"]["knn_k"], 6)
+        self.assertEqual(state["config"]["knn_keep_ratio"], 0.5)
+        self.assertEqual(state["config"]["knn_metric"], "cosine")
+        self.assertEqual(state["config"]["knn_backend"], "sklearn")
+        self.assertEqual(state["config"]["knn_retention_ratio"], 0.5)
+        self.assertEqual(summary["total_harmful_tokens"], 2)
+        self.assertFalse(summary["degenerate"])
 
 
 if __name__ == "__main__":

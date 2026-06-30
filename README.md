@@ -1,93 +1,86 @@
-# Adaptive Steering and Remasking for Safe Generation in Diffusion Language Models
+# 扩散语言模型中用于安全生成的自适应引导与重掩码
 
+> **自适应引导与重掩码** 提出了一种无需训练的安全框架，通过在去噪过程中引导有害生成轨迹，防止扩散语言模型中的越狱攻击。
 
-> **Adaptive Steering and Remasking** proposes a training-free safety framework that prevents jailbreak attacks in diffusion language models by steering harmful generation trajectories during the denoising process.
-
-## 🛡️ DLM Steering and Remasking
+## 🛡️ DLM 引导与重掩码
 
 ![overview](./assets/overview_figure.png)
 
+我们提出了一种面向扩散语言模型（DLM）的无需训练的安全框架，在去噪过程中结合了自适应语义引导与有害令牌重掩码。
 
-We proposes a training-free safety framework for diffusion language models (DLMs) that combines adaptive semantic steering and harmful token remasking during the denoising process.  
+该方法首先构建一个**对比安全方向（CSD）**来区分有害与安全的语义表示，并在早期去噪阶段应用**自适应引导**，将生成过程导向更安全的轨迹。
 
-The method first constructs a **Contrastive Safety Direction (CSD)** to distinguish harmful and safe semantic representations, and applies **adaptive steering** in the early denoising stages to guide generation toward safer trajectories.  
+然后执行**选择性令牌重掩码**，重新生成可能有毒的令牌，在有效降低越狱攻击的同时，保持生成回复的流畅性与整体质量。
 
-It then performs **selective token remasking** to regenerate potentially harmful tokens, effectively reducing jailbreak attacks while preserving the fluency and overall quality of generated responses.
-
-
-## Preliminary Analysis
-### Vulnerability of Early Denoising Steps
+## 初步分析
+### 早期去噪步骤的脆弱性
 <p align="center">
   <img src="./assets/motivation01.png" alt="analysis" width="350"/>
 </p>
 
-DLMs exhibit a unique vulnerability during iterative denoising. Unlike autoregressive LLMs, tokens generated at early denoising steps strongly influence the entire generation trajectory. To analyze this behavior, we conduct a controlled first-token priming experiment.
-We insert either `Sure` (compliance-inducing token) or `Sorry` (refusal token) at different denoising steps during generation.
+DLM 在迭代去噪过程中表现出独特的脆弱性。与自回归 LLM 不同，早期去噪步骤生成的令牌会强烈影响整个生成轨迹。为分析这一行为，我们进行了受控的首令牌启动实验——在生成过程中的不同去噪步骤插入 `Sure`（诱导顺从的令牌）或 `Sorry`（拒绝令牌）。
 
-### Observation
-Early harmful tokens strongly affect final outputs Injecting `Sure` at early denoising steps significantly increases jailbreak success rates. Injecting `Sorry` suppresses harmful generation.
-The influence becomes weaker at later denoising stages.
-> Early denoising trajectories play a critical role in determining final safety behavior
+### 观察
+早期有害令牌强烈影响最终输出。在早期去噪步骤注入 `Sure` 显著提高越狱成功率，注入 `Sorry` 则抑制有害生成。该影响在后期去噪阶段逐渐减弱。
+> 早期去噪轨迹对最终安全行为起着决定性作用
 
+### 现有防御方法的局限性
 
-### Limitation of Existing Defenses
+现有的基于重掩码的防御主要依赖全局令牌抑制。然而，激进的掩码引入了一个严重的权衡：
 
-Existing remasking-based defenses mainly rely on global token suppression. 
-However, aggressive remasking introduces a severe trade-off:
+- 有害令牌被移除，
+- 但有用的语义信息也被破坏。
 
-- harmful tokens are removed,
-- but useful semantic information is also destroyed.
+结果，模型常常产生：
 
-As a result, models often produce:
+- 空回复，
+- 破碎的句子，
+- 生成质量下降。
 
-- empty responses,
-- broken sentences,
-- degraded generation quality.
+这表明单纯抑制令牌不足以实现安全的 DLM 生成。
 
-This indicates that simply suppressing tokens is insufficient for safe DLM generation.
+### 动机
 
-### Motivation
+我们不采用全局抑制生成的方式，而是通过以下手段直接控制去噪轨迹：
+- 语义引导
+- 选择性有害令牌重掩码
 
-Instead of globally suppressing generation, we directly control the denoising trajectory through:
-- semantic steering  
-- selective harmful token remasking
+这使得模型能够在有效减少有害输出的同时，保持生成质量。
 
-This allows the model to maintain generation quality while effectively reducing harmful outputs.
+## 方法
 
-## Method
+### 1. 对比安全方向（CSD）
+我们构建一个潜在的安全方向，捕捉`有害回复`与`安全拒绝回复`之间的语义差异。
 
-### 1. Contrastive Safety Direction (CSD)
-We construct a latent safety direction that captures the semantic difference between `harmful responses` and `safe refusal responses`.
+该方向用于估计中间令牌表示是否与有害语义对齐。
 
-This direction is used to estimate whether intermediate token representations are aligned with harmful semantics.
+### 2. 早期步骤自适应引导
+在早期去噪阶段，我们抑制隐藏表示中的有害语义方向。
 
-### 2. Early-Step Adaptive Steering
-During the early denoising stages, we suppress harmful semantic directions in hidden representations.
+**核心思想**
+> 有害对齐强烈 → 引导力度更强
+> 有害对齐较弱 → 干扰最小化
 
-**Key Idea**
-> strong harmful alignment → stronger steering  
-> weak harmful alignment → minimal perturbation
+这可以防止有害轨迹在生成过程中趋于稳定。
 
-This prevents harmful trajectories from becoming stabilized during generation.
+**优势**
+- 早期抑制不安全生成
+- 保持生成流畅性
+- 避免过度干预
 
-**Benefits**
-- suppresses unsafe generation early  
-- preserves fluent generation  
-- avoids excessive intervention  
+### 3. 有害令牌重掩码
+在引导之后，我们通过选择性地重掩码有害令牌来进一步优化生成的序列。
 
-### 3. Harmful Token Remasking
-After steering, we further refine the generated sequence by selectively remasking harmful tokens.
+我们的方法不是重新生成整个序列，而是：
+1. 检测有害令牌位置
+2. 仅重掩码可疑令牌
+3. 重新生成更安全的替代内容
 
-Instead of regenerating the entire sequence, our method:
-1. detects harmful token positions
-2. remasks only suspicious tokens
-3. regenerates safer alternatives
+这种局部优化在保持流畅性和连贯性的同时提高了安全性。
 
-This local refinement improves safety while maintaining fluency and coherence.
+## 实验结果
 
-## Experimental Results
-
-|Benchmark|Model|Method|Avg.ASR ↓|
+|基准|模型|方法|平均 ASR ↓|
 |-|-|-|-|
 |JailBreakBench|LLaDA|Vanilla|35.67|
 |||DiffuGuard|32.00|
@@ -96,67 +89,67 @@ This local refinement improves safety while maintaining fluency and coherence.
 |||DiffuGuard|19.00|
 |||**Ours**|**8.00**|
 
-Our framework consistently reduces jailbreak attack success rates across `DIJA attacks`, `PAP attacks`, `Prefix attacks`, while preserving generation utility better than existing remasking-based defenses.
+我们的框架在 `DIJA攻击`、`PAP攻击`、`前缀攻击` 上持续降低越狱攻击成功率，同时比现有基于重掩码的防御方法更好地保持了生成效用。
 
+## 分析
+### 消融实验
 
-## Aanalysis
-### Ablation Study
+我们评估了框架中每个组件的贡献。
 
-We evaluate the contribution of each component in our framework.
-
-|Variant|Description|ASR (%) ↓|
+|变体|描述|ASR (%) ↓|
 |-|-|-|
-|Full|Phase 1 + Phase 2|18|
-|w/o Phase 1|Remove adaptive steering|54|
-|w/o Phase 2-Steering|Remove steering during remasking|66|
-|w/o Phase 2|Remove remasking|56|
-|Baseline|Vanilla LLaDA|100|
+|完整|阶段 1 + 阶段 2|18|
+|无阶段 1|移除自适应引导|54|
+|无阶段 2-引导|在重掩码过程中移除引导|66|
+|无阶段 2|移除重掩码|56|
+|基线|Vanilla LLaDA|100|
 
-**Key Observations**
-- Early-step steering is critical for establishing safe denoising trajectories.
-- Remasking effectively suppresses harmful token propagation.
-- Combining steering and remasking achieves the strongest robustness.
+**关键观察**
+- 早期步骤引导对于建立安全的去噪轨迹至关重要。
+- 重掩码有效抑制有害令牌传播。
+- 引导与重掩码的结合实现了最强的鲁棒性。
 
-### Generalization Capability
-We additionally evaluate whether the defense preserves general model utility.
+### 泛化能力
 
-Benchmarks: `TruthfulQA`, `MATH-500`, `MMLU`
+我们进一步评估该防御是否保持模型的通用效用。
 
-Compared to prior remasking-based defenses, our method better preserves:
+基准：`TruthfulQA`、`MATH-500`、`MMLU`
 
-- reasoning capability
-- semantic consistency
-- generation fluency
+与先前基于重掩码的防御相比，我们的方法更好地保持了：
 
-while still maintaining strong jailbreak robustness.
+- 推理能力
+- 语义一致性
+- 生成流畅性
 
-## 🛠️ Setup
-We used the `JailBreakBench` and `AdvBench` benchmark.
-### Setting Up the Environment
+同时仍然保持强大的越狱鲁棒性。
+
+## 🛠️ 环境配置
+我们使用了 `JailBreakBench` 和 `AdvBench` 基准。
+### 环境搭建
 ```bash
 $ conda create -n dlm_steering python=3.10
 $ conda activate dlm_steering
 $ pip install -r requirements.txt
 $ mkdir outputs
 ```
-## 🚀 Usage
-### Making Contrastive Safety Direction
+## 🚀 使用方式
+### 生成对比安全方向
 ```bash
 $ python utils/make_csd_llada.py
 $ python utils/make_csd_dream.py
 ```
 
-### Inference
-#### 1. Edit the `scripts/dream_steer.sh` or `scripts/llada_steer.sh` file
+### 推理
+#### 1. 编辑 `scripts/dream_steer.sh` 或 `scripts/llada_steer.sh` 文件
 ```txt
 python eval_llada_steering.py \
-    --csv_path <dataset> \
-    --attack_method <attack method> \
-    --model_path <model path> \
+    --csv_path <数据集> \
+    --attack_method <攻击方法> \
+    --model_path <模型路径> \
     --self_reminder False \
-    --generated_samples_path <save path> \
-    --steering_vector_path <steering vector> \
-    --target_layer <select the layer to apply the steering vector> \
+    --generated_samples_path <保存路径> \
+    --steering_vector_path <引导向量> \
+    --target_layer <选择应用引导向量的层> \
     --sampling_steps 128 \
     --mask_length 128 \
     --block_size 128 \
@@ -167,31 +160,30 @@ python eval_llada_steering.py \
     --device cuda:0
 
 ```
-Attack Method:
+攻击方法：
 - zeroshot
 - PAP
 - DIJA
 - prefix
 
-If you want to use the DIJA attack:
+如需使用 DIJA 攻击：
 ```bash
 $ git clone https://github.com/ZichenWen1/DIJA.git
 ```
 
-#### 2. Start inference
+#### 2. 开始推理
 ```bash
 $ sh scripts/llada_steer.sh
 $ sh scripts/dream_steer.sh
 ```
-### Evaluation
+### 评估
 ```bash
-$ sh scripts/llama_guard.sh             # llama_guard (JailBreakBench, AdvBench)
-$ sh scripts/test_rouge_score.sh        # rouge_score (TruthfulQA)
-$ sh scripts/mmlu_eval.sh               # accuracy (MMLU)
-$ sh scripts/math-500_eval.sh           # accuracy (MATH-500)
+$ sh scripts/llama_guard.sh             # llama_guard 评估（JailBreakBench, AdvBench）
+$ sh scripts/test_rouge_score.sh        # rouge_score 评估（TruthfulQA）
+$ sh scripts/mmlu_eval.sh               # 准确率评估（MMLU）
+$ sh scripts/math-500_eval.sh           # 准确率评估（MATH-500）
 ```
 
-
 ---
-### Additional Information
-Our code is based on the code from [LLaDA](https://github.com/guanghanwang/ReMDM-LLaDA), [Dream](https://github.com/DreamLM/Dream), and [ReMDM-LLaDA](https://github.com/guanghanwang/ReMDM-LLaDA).
+### 附加信息
+我们的代码基于 [LLaDA](https://github.com/guanghanwang/ReMDM-LLaDA)、[Dream](https://github.com/DreamLM/Dream) 和 [ReMDM-LLaDA](https://github.com/guanghanwang/ReMDM-LLaDA) 的代码。
