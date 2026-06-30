@@ -1,0 +1,74 @@
+diff --git a/run_harmbench/models/harmbench_llada.py b/run_harmbench/models/harmbench_llada.py
+index 58a6316..ccdcf33 100644
+--- a/run_harmbench/models/harmbench_llada.py
++++ b/run_harmbench/models/harmbench_llada.py
+@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--mask_counts", type=int, default=DEFAULT_MASK_COUNTS)
+     parser.add_argument("--attack_method", type=str, default="zeroshot")
+     parser.add_argument("--defense_method", type=str, default=None)
++    parser.add_argument("--tokens_per_step", type=int, default=1)
+ 
+     return parser.parse_args()
+ 
+@@ -92,7 +93,8 @@ def generate_response(
+         gen_length=args.gen_length,
+         block_length=args.steps,
+         temperature=0.2,
+-        mask_id=args.mask_id
++        mask_id=args.mask_id,
++        tokens_per_step=args.tokens_per_step
+     )
+ 
+     response = tokenizer.batch_decode(output_ids[:, matching_count:], skip_special_tokens=True)[0]
+diff --git a/run_harmbench/utility/generate_function.py b/run_harmbench/utility/generate_function.py
+index 44c0ccf..43f5bf7 100644
+--- a/run_harmbench/utility/generate_function.py
++++ b/run_harmbench/utility/generate_function.py
+@@ -96,7 +96,8 @@ def generate_llada(
+     temperature=0.0,
+     cfg_scale=0.0,
+     remasking="low_confidence",
+-    mask_id=126336
++    mask_id=126336,
++    tokens_per_step=1
+ ):
+     with torch.no_grad():
+         batch_size, prompt_length = input_ids.shape
+@@ -107,12 +108,9 @@ def generate_llada(
+             device=model.device,
+         )
+         x = input_ids
+-        # feature_cache = dLLMCache()
+-        # feature_cache.reset_cache(0) 
+-        num_transfer_tokens = 1
++        num_transfer_tokens = tokens_per_step
+         while (x == mask_id).any():
+             mask_index = x == mask_id
+-            # pdb.set_trace()
+             logits = model(x, attention_mask=attention_mask).logits
+             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+             x0 = torch.argmax(logits_with_noise, dim=-1)
+@@ -135,15 +133,16 @@ def generate_llada(
+                 x0, dtype=torch.bool, device=x0.device
+             )
+             for j in range(confidence.shape[0]):
+-                if (x[j] == mask_id).any():
+-                    select_index = torch.topk(
+-                        confidence[j], k=num_transfer_tokens
+-                    ).indices
+-                    transfer_index[j, select_index] = True
++                available = int(mask_index[j].sum().item())
++                k = min(num_transfer_tokens, available)
++                if k <= 0:
++                    continue
++                select_index = torch.topk(
++                    confidence[j], k=k
++                ).indices
++                transfer_index[j, select_index] = True
+             x[transfer_index] = x0[transfer_index]
+-            # pdb.set_trace()
+         return x
+-    
+ 
+ 
+ def generate_mmada(
