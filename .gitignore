@@ -219,3 +219,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === 项目大件与第三方（不入库） ===
+# 模型权重与数据集
+/models/
+/data/
+# 打包产物
+*.tar.gz
+*.zip
+# 第三方子项目（改动见 scripts/patches/）
+/DIJA/
+/gpt-oss/
+# git worktree
+.worktrees/
+# 编辑器 / 工具缓存
+.serena/
+.cursor/
