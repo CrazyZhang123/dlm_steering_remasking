@@ -11,6 +11,13 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from tqdm import tqdm
 from utils import REFERENCES, SAFE_REMINDER
+from utils.batching import (
+    build_padded_xt,
+    extract_layer_hidden,
+    forward_logits,
+    pad_token_rows,
+    rowwise_topk_transfer,
+)
 from utils.ct_csd_bank import CTCSDBank
 from transformers import AutoTokenizer, AutoModel
 import json
@@ -75,6 +82,273 @@ def _sample_categorical(categorical_probs):
   return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
 
+# ==================================================================
+# 批量采样核心（模块级函数，接收 harness 对象）
+#
+# 实现为模块级函数而非类方法，原因有二：
+# 1. 单样本方法与批量方法共享同一实现（DRY），batch=1 且无 pad 时与
+#    历史单样本实现逐位等价（forward 调用形式、RNG 消耗形状均一致）；
+# 2. 现有测试以未绑定方式（LLaDAEvalHarness.method(duck_dummy, ...)）
+#    调用类方法，模块级函数间互调不依赖 self 上的方法解析。
+#
+# 批量化关键约定：
+# - 变长 prompt 右 pad（pad 值 = eos），attention_mask 屏蔽 pad key；
+#   RoPE 位置由下标决定，右 pad 不改变真实 token 的位置编码。
+# - 原实现的 eos 提前退出（整条 return）改为按行冻结（done mask），
+#   已冻结行不再参与揭码 / steering / Phase 2。
+# - Phase 2 的逐样本提前退出（n_harmful == 0 即 break）改为活跃行
+#   压缩：已收敛的行退出 batch，剩余行继续 refinement。
+# ==================================================================
+
+
+def _call_refill(harness, xt_rows, block_start, block_end, valid_rows):
+    # 仅在存在 pad 时传 valid，保持无 pad 路径与旧签名的调用形式一致
+    if valid_rows is not None and not bool(valid_rows.all()):
+        return harness._refill_masks_with_steering(xt_rows, block_start, block_end, valid=valid_rows)
+    return harness._refill_masks_with_steering(xt_rows, block_start, block_end)
+
+
+@torch.no_grad()
+def _refine_block_batch(harness, xt, valid, blk_start, blk_end, done):
+    """Phase 2 批量版：对刚解码完的 block 做安全检测 + 重掩码（原地更新 xt）。
+
+    与单样本语义等价：每行独立执行"检测→无害则收敛退出→有害则 remask+refill"，
+    最多 max_refinement_iters 轮；收敛行从活跃集中移除（行压缩），后续轮次的
+    前向只包含仍有有害 token 的行。
+    """
+    active = (~done).nonzero(as_tuple=False).squeeze(-1)
+    block_size = harness.block_size
+    layer_module = harness.model.model.transformer.blocks[harness.target_layer]
+    col_offsets = torch.arange(block_size, device=xt.device)
+
+    for _ in range(harness.max_refinement_iters):
+        if active.numel() == 0:
+            return
+
+        xt_active = xt[active]
+        valid_active = valid[active]
+        hidden = extract_layer_hidden(harness.model, layer_module, xt_active, valid_active)
+        col_idx = blk_start[active].unsqueeze(1) + col_offsets.unsqueeze(0)          # [Na, block_size]
+        block_hidden = hidden.gather(1, col_idx.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+        per_token_alignment = harness._per_token_alignment(block_hidden)             # [Na, block_size]
+
+        harmful_mask = per_token_alignment > harness.alignment_threshold
+        still_harmful = harmful_mask.reshape(active.numel(), -1).any(dim=1)          # [Na]
+        if not bool(still_harmful.any()):
+            return
+
+        rows = active[still_harmful]
+        remask = torch.zeros((rows.numel(), xt.shape[1]), dtype=torch.bool, device=xt.device)
+        remask.scatter_(1, col_idx[still_harmful], harmful_mask[still_harmful])
+        full_harmful_mask = torch.zeros_like(xt, dtype=torch.bool)
+        full_harmful_mask[rows] = remask
+        xt[full_harmful_mask] = harness.mask_id
+
+        xt[rows] = _call_refill(harness, xt[rows], blk_start[rows], blk_end[rows], valid[rows])
+        active = rows
+
+
+@torch.no_grad()
+def _block_decode_batch(harness, xt, valid, prompt_lens, enable_steering):
+    """Phase 1 逐 block 解码（+ 可选 steering 与 Phase 2）的批量核心。
+
+    xt: [B, Lmax] 右 pad 序列；valid: [B, Lmax]；prompt_lens: [B] 生成区起点。
+    B=1 且无 pad 时与原单样本实现逐位等价（同种子下 RNG 消耗一致）。
+    """
+    batch, max_len = xt.shape
+    pos = torch.arange(max_len, device=xt.device)
+
+    assert harness.mask_length % harness.block_size == 0
+    num_blocks = harness.mask_length // harness.block_size
+
+    assert harness.sampling_steps % num_blocks == 0
+    steps = harness.sampling_steps // num_blocks
+
+    assert harness.mask_length % harness.sampling_steps == 0
+
+    can_steer = enable_steering and harness._can_steer()
+    initial_steering_steps = int(steps * harness.initial_steering_ratio) if can_steer else 0
+    k = harness.mask_length // harness.sampling_steps
+    eos_id = harness.tokenizer.eos_token_id
+    done = torch.zeros(batch, dtype=torch.bool, device=xt.device)
+
+    for num_block in range(num_blocks):
+        blk_start = prompt_lens + num_block * harness.block_size                     # [B]
+        blk_end = blk_start + harness.block_size                                     # [B]
+        in_block = (pos.unsqueeze(0) >= blk_start.unsqueeze(1)) & (pos.unsqueeze(0) < blk_end.unsqueeze(1))
+
+        for i in range(steps):
+            mask_index = (xt == harness.mask_id)
+
+            hook_handle = None
+            if can_steer and i < initial_steering_steps:
+                block_mask_index = mask_index & in_block & ~done.unsqueeze(1)
+                if block_mask_index.any():
+                    steering_hook = harness._build_adaptive_steering_hook(block_mask_index)
+                    hook_handle = harness.model.model.transformer.blocks[harness.target_layer].register_forward_hook(steering_hook)
+
+            try:
+                logits = forward_logits(harness.model, xt, valid)
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
+
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0 = _sample_categorical(p)
+            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+
+            # 逐行 block 边界约束：只允许在各自 block 范围内产生新 token
+            x0_p[pos.unsqueeze(0) >= blk_end.unsqueeze(1)] = -np.inf
+            x0 = torch.where(mask_index, x0, xt)
+            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+            transfer_index = rowwise_topk_transfer(confidence, k) & ~done.unsqueeze(1)
+            xt[transfer_index] = x0[transfer_index]
+
+        if can_steer:
+            _refine_block_batch(harness, xt, valid, blk_start, blk_end, done)
+
+        # 原实现在 block 完成后发现 eos 即整条 return；批量版冻结该行
+        done |= ((xt == eos_id) & valid).any(dim=1)
+        if bool(done.all()):
+            break
+
+    return xt
+
+
+@torch.no_grad()
+def _sample_blocks_batch(harness, prompts, inject_prompt, enable_steering):
+    """构造右 pad 批量序列并跑批量 block 解码，返回按行截去 pad 的 1-D 序列列表。"""
+    device = harness.model.device
+    xt, valid, prompt_lens, total_lens = build_padded_xt(
+        prompts,
+        mask_length=harness.mask_length,
+        mask_id=harness.mask_id,
+        pad_id=harness.tokenizer.eos_token_id,
+        inject_prompt=inject_prompt,
+        device=device,
+    )
+    xt = _block_decode_batch(harness, xt, valid, prompt_lens, enable_steering)
+    return [xt[b, : int(total_lens[b])] for b in range(xt.shape[0])]
+
+
+@torch.no_grad()
+def _dija_sample_batch(harness, refined_goals, vanilla_goals, mask_counts):
+    """DIJA 模式批量采样，返回 [(generated_ids_1d, matching_count), ...]。"""
+    device = harness.device
+    rows, matching_counts = [], []
+    for refined_goal, vanilla_goal in zip(refined_goals, vanilla_goals):
+        refined_text = harness._build_dija_prompt_text(refined_goal, mask_counts)
+        refined_ids = harness.tokenizer(refined_text, return_tensors="pt")["input_ids"].to(device)
+
+        if vanilla_goal is not None:
+            vanilla_text = harness.tokenizer.apply_chat_template(
+                [{"role": "user", "content": vanilla_goal}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            vanilla_ids = harness.tokenizer(vanilla_text, return_tensors="pt")["input_ids"].to(device)
+            common_len = min(vanilla_ids.shape[1], refined_ids.shape[1])
+            eq = (vanilla_ids[0, :common_len] == refined_ids[0, :common_len])
+            first_diff = (~eq).nonzero(as_tuple=False)
+            matching_count = int(first_diff[0].item()) if first_diff.numel() > 0 else common_len
+        else:
+            matching_count = 0
+
+        rows.append(refined_ids[0])
+        matching_counts.append(matching_count)
+
+    lens = {int(r.shape[0]) for r in rows}
+    pad_id = getattr(harness.tokenizer, "eos_token_id", None) if len(lens) > 1 else None
+    xt, valid, total_lens = pad_token_rows(rows, pad_id=pad_id, device=device)
+    original_mask_index = (xt == harness.mask_id)
+
+    can_steer = harness._can_steer()
+    steps = harness.sampling_steps
+    initial_steering_steps = int(steps * harness.initial_steering_ratio) if can_steer else 0
+
+    for i in range(steps):
+        mask_index = (xt == harness.mask_id)
+        if not mask_index.any():
+            break
+
+        hook_handle = None
+        if can_steer and i < initial_steering_steps:
+            steering_hook = harness._build_adaptive_steering_hook(mask_index)
+            hook_handle = harness.model.model.transformer.blocks[harness.target_layer].register_forward_hook(steering_hook)
+
+        try:
+            logits = forward_logits(harness.model, xt, valid)
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0 = _sample_categorical(p)
+        x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+
+        x0 = torch.where(mask_index, x0, xt)
+        confidence = torch.where(mask_index, x0_p, -np.inf)
+
+        steps_remaining = steps - i
+        transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+        for j in range(confidence.shape[0]):
+            remaining = int(mask_index[j].sum().item())
+            if remaining == 0:
+                continue
+            k = max(1, (remaining + steps_remaining - 1) // steps_remaining)
+            k = min(k, remaining)
+            _, select_index = torch.topk(confidence[j], k=k)
+            transfer_index[j, select_index] = True
+        xt[transfer_index] = x0[transfer_index]
+
+    # ---- Phase 2 (DIJA): 全部解码完成后做 batch remask ----
+    # 不同于 block 模式按 block 做 remask，DIJA 对整个序列一次性检测+remask
+    # harmful_mask 用 original_mask_index 过滤，只对初始就是 mask 的位置做 remask
+    if can_steer:
+        active = original_mask_index.any(dim=1).nonzero(as_tuple=False).squeeze(-1)
+        layer_module = harness.model.model.transformer.blocks[harness.target_layer]
+        for refinement_iter in range(harness.max_refinement_iters):
+            if active.numel() == 0:
+                break
+            xt_active = xt[active]
+            valid_active = valid[active]
+            original_mask_active = original_mask_index[active]
+
+            full_hidden = extract_layer_hidden(harness.model, layer_module, xt_active, valid_active)
+            if harness.steering_bank is not None:
+                alignment = harness.steering_bank.alignment(
+                    full_hidden,
+                    theta=harness.alignment_threshold,
+                    record=False,
+                )
+                _ = harness.steering_bank.alignment(
+                    full_hidden[original_mask_active],
+                    theta=harness.alignment_threshold,
+                    record=True,
+                )
+            else:
+                sv = harness.steering_vector.to(full_hidden.device, dtype=full_hidden.dtype)
+                sv_unit = sv / (sv.norm() + 1e-8)
+                alignment = (full_hidden * sv_unit).sum(dim=-1)
+
+            harmful_mask = (alignment > harness.alignment_threshold) & original_mask_active
+            still_harmful = harmful_mask.any(dim=1)
+            if not bool(still_harmful.any()):
+                break
+
+            rows_idx = active[still_harmful]
+            xt_rows = xt[rows_idx]
+            xt_rows[harmful_mask[still_harmful]] = harness.mask_id
+            xt[rows_idx] = _call_refill(harness, xt_rows, 0, xt.shape[1], valid[rows_idx])
+            active = rows_idx
+
+    return [
+        (xt[b, : int(total_lens[b])], matching_counts[b])
+        for b in range(xt.shape[0])
+    ]
+
+
 @register_model("llada_dist")
 class LLaDAEvalHarness(LM):
     def __init__(
@@ -103,6 +377,7 @@ class LLaDAEvalHarness(LM):
         dija_mask_counts=36,
         inject_prompt=True,
         attack_method='zeroshot',
+        gen_batch_size=1,
     ):
         super().__init__()
 
@@ -165,6 +440,7 @@ class LLaDAEvalHarness(LM):
         self.initial_steering_ratio = initial_steering_ratio
         self.dija_mask_counts = dija_mask_counts
         self.inject_prompt = inject_prompt
+        self.gen_batch_size = int(gen_batch_size)
         if inject_prompt:
             print("inject_prompt enabled: a copy of the prompt is placed at the front of the "
                   "generation region; only the trailing mask_length tokens are decoded as output.")
@@ -334,59 +610,13 @@ class LLaDAEvalHarness(LM):
 
     @torch.no_grad()
     def llada_conf_sample(self, prompt):
-        xt = torch.full((1, prompt.shape[1] + self.mask_length), self.mask_id, dtype=torch.long).to(self.model.device)
-        xt[:, :prompt.shape[1]] = prompt.clone()
-
-        prompt_index = (xt != self.mask_id)
-        prompt_len = prompt_index.sum(1).item()
-
-        assert self.mask_length % self.block_size == 0
-        num_blocks = self.mask_length // self.block_size
-
-        assert self.sampling_steps % num_blocks == 0
-        steps = self.sampling_steps // num_blocks
-
-        assert self.mask_length % self.sampling_steps == 0
-
-        for num_block in range(num_blocks):
-            for i in range(steps):
-                mask_index = (xt == self.mask_id)
-
-                logits = self.model(xt).logits
-
-                p = F.softmax(logits.to(torch.float64), dim=-1)
-                x0 = _sample_categorical(p)
-                x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
-
-                x0_p[:, prompt_len + (num_block + 1) * self.block_size:] = -np.inf
-                x0 = torch.where(mask_index, x0, xt)
-                confidence = torch.where(mask_index, x0_p, -np.inf)
-
-                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(confidence[j], k=int(self.mask_length / self.sampling_steps))
-                    transfer_index[j, select_index] = True
-                xt[transfer_index] = x0[transfer_index]
-            if torch.sum(xt == self.tokenizer.eos_token_id) > 0:
-                return xt
-
-        return xt
+        # 单样本入口：等价于 batch=1 的批量实现（无 pad 时逐位一致）
+        return _sample_blocks_batch(self, [prompt[0]], inject_prompt=False, enable_steering=False)[0].unsqueeze(0)
 
     @torch.no_grad()
-    def _extract_block_hidden(self, xt, block_start, block_end):
-        # 提取 block 区域 [block_start:block_end] 的隐藏状态
-        # 通过 forward hook 获取 target_layer 的输出，然后按 block 边界切片
-        hidden_buffer = [None]
-        def _extract_hook(module, input, output, _buf=hidden_buffer):
-            h = output[0] if isinstance(output, tuple) else output
-            _buf[0] = h.detach()
-            return output
-        handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(_extract_hook)
-        try:
-            _ = self.model(xt).logits
-        finally:
-            handle.remove()
-        return hidden_buffer[0][:, block_start:block_end, :]
+    def llada_conf_sample_batch(self, prompts):
+        # prompts: list[1-D LongTensor]，返回按行截去 pad 的 1-D 序列列表
+        return _sample_blocks_batch(self, prompts, inject_prompt=False, enable_steering=False)
 
     @torch.no_grad()
     def _per_token_alignment(self, block_hidden):
@@ -439,12 +669,16 @@ class LLaDAEvalHarness(LM):
         return steering_hook
 
     @torch.no_grad()
-    def _refill_masks_with_steering(self, xt, block_start, block_end):
+    def _refill_masks_with_steering(self, xt, block_start, block_end, valid=None):
         # Phase 2 辅助方法：对当前 block 的 mask 位置做一次 forward pass，
-        # 并用 adaptive steering 生成替换 token
-        mask_index = (xt == self.mask_id)
-        mask_index[:, :block_start] = False
-        mask_index[:, block_end:] = False
+        # 并用 adaptive steering 生成替换 token。
+        # block_start/block_end 支持标量（全 batch 相同）或 [B] 张量（逐行边界）。
+        pos = torch.arange(xt.shape[1], device=xt.device)
+        if torch.is_tensor(block_start):
+            in_block = (pos.unsqueeze(0) >= block_start.unsqueeze(1)) & (pos.unsqueeze(0) < block_end.unsqueeze(1))
+        else:
+            in_block = ((pos >= block_start) & (pos < block_end)).unsqueeze(0)
+        mask_index = (xt == self.mask_id) & in_block
         if not mask_index.any():
             return xt
 
@@ -452,7 +686,7 @@ class LLaDAEvalHarness(LM):
         hook_handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(steering_hook)
 
         try:
-            logits = self.model(xt).logits
+            logits = forward_logits(self.model, xt, valid)
         finally:
             hook_handle.remove()
 
@@ -471,7 +705,7 @@ class LLaDAEvalHarness(LM):
         #   - 将 mask_length 划分为 num_blocks 个 block
         #   - 每个 block 内执行 steps 次 confidence-based 逐步解码
         #   - 每次揭掉 confidence 最高的 k = mask_length / sampling_steps 个 token
-        #   - block 边界约束: x0_p[:, block_end:] = -np.inf，确保不跨 block
+        #   - block 边界约束: 置信度在 block_end 之后置 -inf，确保不跨 block
         #   - 前 initial_steering_steps 步应用 adaptive steering hook
         #
         # Phase 2 (block 级安全检测 + remask):
@@ -483,99 +717,16 @@ class LLaDAEvalHarness(LM):
         #
         # 不是每生成一个 token 就去检测安全，
         # 而是等整个 block 的所有 token 解码完成后，才批量检测和 remask
+        #
+        # 实现位于模块级 _block_decode_batch / _refine_block_batch，
+        # 单样本入口等价于 batch=1 的批量调用（无 pad 时逐位一致）。
         # ==============================================================
-        P = prompt.shape[1]
-        if self.inject_prompt:
-            total_len = P + P + self.mask_length
-            xt = torch.full((1, total_len), self.mask_id, dtype=torch.long).to(self.model.device)
-            xt[:, :P] = prompt.clone()
-            xt[:, P:2 * P] = prompt.clone()
-        else:
-            xt = torch.full((1, P + self.mask_length), self.mask_id, dtype=torch.long).to(self.model.device)
-            xt[:, :P] = prompt.clone()
+        return _sample_blocks_batch(self, [prompt[0]], inject_prompt=self.inject_prompt, enable_steering=True)[0].unsqueeze(0)
 
-        prompt_index = (xt != self.mask_id)
-        prompt_len = prompt_index.sum(1).item()
-
-        assert self.mask_length % self.block_size == 0
-        num_blocks = self.mask_length // self.block_size
-
-        assert self.sampling_steps % num_blocks == 0
-        steps = self.sampling_steps // num_blocks
-
-        assert self.mask_length % self.sampling_steps == 0
-
-        can_steer = self._can_steer()
-        initial_steering_steps = int(steps * self.initial_steering_ratio) if can_steer else 0
-
-        # ---- Phase 1: 逐 block 解码（confidence-based 逐步揭掩码） ----
-        for num_block in range(num_blocks):
-            block_start = prompt_len + num_block * self.block_size
-            block_end = prompt_len + (num_block + 1) * self.block_size
-
-            for i in range(steps):
-                mask_index = (xt == self.mask_id)
-
-                # 前 initial_steering_steps 步可选的 adaptive steering
-                hook_handle = None
-                if can_steer and i < initial_steering_steps:
-                    block_mask_index = mask_index.clone()
-                    block_mask_index[:, :block_start] = False
-                    block_mask_index[:, block_end:] = False
-                    if block_mask_index.any():
-                        steering_hook = self._build_adaptive_steering_hook(block_mask_index)
-                        hook_handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(steering_hook)
-
-                try:
-                    logits = self.model(xt).logits
-                finally:
-                    if hook_handle is not None:
-                        hook_handle.remove()
-
-                p = F.softmax(logits.to(torch.float64), dim=-1)
-                x0 = _sample_categorical(p)
-                x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
-
-                # block 边界约束：只允许在 block 范围内产生新 token
-                x0_p[:, block_end:] = -np.inf
-                x0 = torch.where(mask_index, x0, xt)
-                confidence = torch.where(mask_index, x0_p, -np.inf)
-
-                # 只揭掉 confidence 最高的 k 个 token
-                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(confidence[j], k=int(self.mask_length / self.sampling_steps))
-                    transfer_index[j, select_index] = True
-                xt[transfer_index] = x0[transfer_index]
-
-            # ---- Phase 2: block 全部解码完成后，做安全检测 + remask ----
-            if can_steer:
-                for refinement_iter in range(self.max_refinement_iters):
-                    # 提取 block 的隐藏状态
-                    block_hidden = self._extract_block_hidden(xt, block_start, block_end)
-                    # 计算每个 token 与 steering vector 的对齐程度
-                    per_token_alignment = self._per_token_alignment(block_hidden)  # [1, block_size]
-
-                    # 检测有害 token：alignment 超过阈值的标记为有害
-                    harmful_mask = per_token_alignment > self.alignment_threshold  # [1, block_size]
-                    n_harmful = harmful_mask.sum().item()
-
-                    if n_harmful == 0:
-                        # block 内没有有害 token，跳过 remask
-                        break
-
-                    # 将有害 token 重掩码为 mask_id
-                    full_harmful_mask = torch.zeros_like(xt, dtype=torch.bool)
-                    full_harmful_mask[:, block_start:block_end] = harmful_mask
-                    xt[full_harmful_mask] = self.mask_id
-
-                    # 用 adaptive steering 重新生成
-                    xt = self._refill_masks_with_steering(xt, block_start, block_end)
-
-            if torch.sum(xt == self.tokenizer.eos_token_id) > 0:
-                return xt
-
-        return xt
+    @torch.no_grad()
+    def llada_remask_sample_batch(self, prompts):
+        # prompts: list[1-D LongTensor]，返回按行截去 pad 的 1-D 序列列表
+        return _sample_blocks_batch(self, prompts, inject_prompt=self.inject_prompt, enable_steering=True)
 
     def _build_dija_prompt_text(self, refined_goal, mask_counts):
         prompt = self.tokenizer.apply_chat_template(
@@ -590,168 +741,95 @@ class LLaDAEvalHarness(LM):
 
     @torch.no_grad()
     def llada_dija_sample(self, refined_goal, vanilla_goal=None, mask_counts=36):
-        refined_text = self._build_dija_prompt_text(refined_goal, mask_counts)
-        refined_ids = self.tokenizer(refined_text, return_tensors="pt")["input_ids"].to(self.device)
+        # 单样本入口：等价于 batch=1 的批量实现（无 pad 时逐位一致）
+        generated_ids, matching_count = _dija_sample_batch(
+            self, [refined_goal], [vanilla_goal], mask_counts
+        )[0]
+        return generated_ids.unsqueeze(0), matching_count
 
-        if vanilla_goal is not None:
-            vanilla_text = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": vanilla_goal}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            vanilla_ids = self.tokenizer(vanilla_text, return_tensors="pt")["input_ids"].to(self.device)
-            common_len = min(vanilla_ids.shape[1], refined_ids.shape[1])
-            eq = (vanilla_ids[0, :common_len] == refined_ids[0, :common_len])
-            first_diff = (~eq).nonzero(as_tuple=False)
-            matching_count = int(first_diff[0].item()) if first_diff.numel() > 0 else common_len
-        else:
-            matching_count = 0
-
-        xt = refined_ids.clone()
-        original_mask_index = (xt == self.mask_id)
-        if not original_mask_index.any():
-            return xt, matching_count
-
-        can_steer = self._can_steer()
-        steps = self.sampling_steps
-        initial_steering_steps = int(steps * self.initial_steering_ratio) if can_steer else 0
-
-        for i in range(steps):
-            mask_index = (xt == self.mask_id)
-            if not mask_index.any():
-                break
-
-            hook_handle = None
-            if can_steer and i < initial_steering_steps:
-                steering_hook = self._build_adaptive_steering_hook(mask_index)
-                hook_handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(steering_hook)
-
-            try:
-                logits = self.model(xt).logits
-            finally:
-                if hook_handle is not None:
-                    hook_handle.remove()
-
-            p = F.softmax(logits.to(torch.float64), dim=-1)
-            x0 = _sample_categorical(p)
-            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
-
-            x0 = torch.where(mask_index, x0, xt)
-            confidence = torch.where(mask_index, x0_p, -np.inf)
-
-            steps_remaining = steps - i
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(confidence.shape[0]):
-                remaining = int(mask_index[j].sum().item())
-                if remaining == 0:
-                    continue
-                k = max(1, (remaining + steps_remaining - 1) // steps_remaining)
-                k = min(k, remaining)
-                _, select_index = torch.topk(confidence[j], k=k)
-                transfer_index[j, select_index] = True
-            xt[transfer_index] = x0[transfer_index]
-
-        # ---- Phase 2 (DIJA): 全部解码完成后做 batch remask ----
-        # 不同于 block 模式按 block 做 remask，DIJA 对整个序列一次性检测+remask
-        # harmful_mask 用 original_mask_index 过滤，只对初始就是 mask 的位置做 remask
-        if can_steer:
-            for refinement_iter in range(self.max_refinement_iters):
-                hidden_buffer = [None]
-                def _extract_hook(module, input, output, _buf=hidden_buffer):
-                    h = output[0] if isinstance(output, tuple) else output
-                    _buf[0] = h.detach()
-                    return output
-                handle = self.model.model.transformer.blocks[self.target_layer].register_forward_hook(_extract_hook)
-                try:
-                    _ = self.model(xt).logits
-                finally:
-                    handle.remove()
-
-                full_hidden = hidden_buffer[0]
-                if self.steering_bank is not None:
-                    alignment = self.steering_bank.alignment(
-                        full_hidden,
-                        theta=self.alignment_threshold,
-                        record=False,
-                    )
-                    _ = self.steering_bank.alignment(
-                        full_hidden[original_mask_index],
-                        theta=self.alignment_threshold,
-                        record=True,
-                    )
-                else:
-                    sv = self.steering_vector.to(full_hidden.device, dtype=full_hidden.dtype)
-                    sv_unit = sv / (sv.norm() + 1e-8)
-                    alignment = (full_hidden * sv_unit).sum(dim=-1)
-
-                harmful_mask = (alignment > self.alignment_threshold) & original_mask_index
-                if harmful_mask.sum().item() == 0:
-                    break
-
-                xt[harmful_mask] = self.mask_id
-                xt = self._refill_masks_with_steering(xt, block_start=0, block_end=xt.shape[1])
-
-        return xt, matching_count
+    @torch.no_grad()
+    def llada_dija_sample_batch(self, refined_goals, vanilla_goals, mask_counts=36):
+        # refined_goals/vanilla_goals: 等长列表（vanilla 元素可为 None），
+        # 返回 [(generated_ids_1d, matching_count), ...]
+        return _dija_sample_batch(self, refined_goals, vanilla_goals, mask_counts)
 
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]):
         is_dija = self.attack_method == 'DIJA'
+        # gen_batch_size 控制每次前向的样本数；1 时保持原单样本路径与行为
+        gen_batch_size = max(1, int(getattr(self, "gen_batch_size", 1)))
 
         out, out_for_json = [], []
-        for req in tqdm(requests):
+        progress = tqdm(total=len(requests))
+        for chunk_start in range(0, len(requests), gen_batch_size):
+            chunk = requests[chunk_start:chunk_start + gen_batch_size]
+
+            # ---- 批量（或单样本）生成，得到每条请求的原始解码文本 ----
             if is_dija:
-                elem = {
-                    "question_text": req.args[0],
-                    "vanilla_goal": req.args[1].get("vanilla_goal", req.args[0]),
-                    "until": req.args[1]["until"],
-                }
+                refined_goals = [req.args[0] for req in chunk]
+                vanilla_goals = [req.args[1].get("vanilla_goal", req.args[0]) for req in chunk]
+                if len(chunk) == 1:
+                    generated_ids, matching_count = self.llada_dija_sample(
+                        refined_goals[0],
+                        vanilla_goal=vanilla_goals[0],
+                        mask_counts=self.dija_mask_counts,
+                    )
+                    pairs = [(generated_ids[0], matching_count)]
+                else:
+                    pairs = self.llada_dija_sample_batch(
+                        refined_goals, vanilla_goals, mask_counts=self.dija_mask_counts
+                    )
+                raw_answers = []
+                for generated_ids, matching_count in pairs:
+                    generated_answer = self.tokenizer.decode(
+                        generated_ids[matching_count:], skip_special_tokens=False
+                    )
+                    raw_answers.append(generated_answer.split("assistant\n")[0])
             else:
-                elem = {
-                    "question": torch.tensor(
-                        self.tokenizer(req.args[0])["input_ids"],
-                        dtype=torch.long,
-                    ),
-                    "question_text": req.args[0],
-                    "until": req.args[1]["until"],
-                }
-            stop_tokens = list(elem["until"]) + ["<|eot_id|>", self.tokenizer.eos_token]
+                prompts = [
+                    torch.tensor(self.tokenizer(req.args[0])["input_ids"], dtype=torch.long)
+                    for req in chunk
+                ]
+                if len(chunk) == 1:
+                    prompt = prompts[0].unsqueeze(0).to(self.device)
+                    if self.sampler == 'llada':
+                        generated_ids = self.llada_conf_sample(prompt)
+                    elif self.sampler == 'steering':
+                        generated_ids = self.llada_remask_sample(prompt)
+                    rows = [generated_ids[0]]
+                else:
+                    if self.sampler == 'llada':
+                        rows = self.llada_conf_sample_batch(prompts)
+                    elif self.sampler == 'steering':
+                        rows = self.llada_remask_sample_batch(prompts)
+                raw_answers = [
+                    self.tokenizer.decode(row[-self.mask_length:], skip_special_tokens=False)
+                    for row in rows
+                ]
 
-            if is_dija:
-                generated_ids, matching_count = self.llada_dija_sample(
-                    elem["question_text"],
-                    vanilla_goal=elem["vanilla_goal"],
-                    mask_counts=self.dija_mask_counts,
-                )
-                generated_answer = self.tokenizer.decode(
-                    generated_ids[0][matching_count:], skip_special_tokens=False
-                )
-                generated_answer = generated_answer.split("assistant\n")[0]
-            else:
-                prompt = elem["question"].unsqueeze(0).to(self.device)
-                if self.sampler == 'llada':
-                    generated_answer = self.llada_conf_sample(prompt)
-                elif self.sampler == 'steering':
-                    generated_answer = self.llada_remask_sample(prompt)
-                generated_answer = self.tokenizer.decode(
-                    generated_answer[0][-self.mask_length:], skip_special_tokens=False
-                )
+            # ---- 逐条后处理：stop token 截断 + 清理特殊 token ----
+            for req, generated_answer in zip(chunk, raw_answers):
+                stop_tokens = list(req.args[1]["until"]) + ["<|eot_id|>", self.tokenizer.eos_token]
+                for stop_seq in stop_tokens:
+                    if stop_seq in generated_answer:
+                        generated_answer = generated_answer.split(stop_seq)[0]
 
-            for stop_seq in stop_tokens:
-                if stop_seq in generated_answer:
-                    generated_answer = generated_answer.split(stop_seq)[0]
+                generated_answer_ids = self.tokenizer(generated_answer)["input_ids"]
+                generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
+                out.append(generated_answer)
+                out_for_json.append({
+                    "prompt": req.args[0],
+                    "response": generated_answer,
+                })
 
-            generated_answer_ids = self.tokenizer(generated_answer)["input_ids"]
-            generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
-            out.append(generated_answer)
-            out_for_json.append({
-                "prompt": elem["question_text"],
-                "response": generated_answer,
-            })
+            # partial 结果按 chunk 落盘（gen_batch_size=1 时与原每样本一次相同）
             if self.generated_samples_path:
                 save_partial_results(self.generated_samples_path, out_for_json)
 
             if self.accelerator is not None:
                 self.accelerator.wait_for_everyone()
+            progress.update(len(chunk))
+        progress.close()
 
         return out
 
@@ -846,6 +924,7 @@ def run_csv_eval(args):
         dija_mask_counts=args.dija_mask_counts,
         inject_prompt=args.inject_prompt,
         attack_method=args.attack_method,
+        gen_batch_size=getattr(args, "gen_batch_size", 1),
     )
 
     if 'MATH' in args.csv_path:
@@ -927,6 +1006,10 @@ if __name__ == "__main__":
         full_parser.add_argument("--model_path", type=str, required=True)
         full_parser.add_argument("--generated_samples_path", type=str, default="./outputs")
         full_parser.add_argument("--batch_size", type=int, default=32)
+        full_parser.add_argument("--gen_batch_size", type=int, default=1,
+                                 help="generate_until 的批量大小（GPU 并行样本数）。与 --batch_size 无关"
+                                      "（后者仅用于 loglikelihood 的 MC 采样）。1 = 原单样本行为；"
+                                      "变长 prompt 会右 pad 到 batch 内最大长度并用 attention_mask 屏蔽。")
         full_parser.add_argument("--sampling_steps", type=int, default=128)
         full_parser.add_argument("--mask_length", type=int, default=128)
         full_parser.add_argument("--block_size", type=int, default=128)

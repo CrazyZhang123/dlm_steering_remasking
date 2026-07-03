@@ -1,4 +1,4 @@
-python utils/eval_llada_steering.py \
+python eval_llada_steering.py \
     --csv_path JBB \
     --attack_method zeroshot \
     --self_reminder False \
@@ -13,4 +13,5 @@ python utils/eval_llada_steering.py \
     --steering_overshoot 1.0 \
     --initial_steering_ratio 0.1 \
     --max_refinement_iters 5 \
+    --gen_batch_size 4 \
     --device cuda:0
