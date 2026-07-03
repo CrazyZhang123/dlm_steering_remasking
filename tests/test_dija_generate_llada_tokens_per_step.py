@@ -6,10 +6,15 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 DIJA_HARMBENCH = ROOT / "DIJA" / "run_harmbench"
-if str(DIJA_HARMBENCH) not in sys.path:
+if DIJA_HARMBENCH.is_dir() and str(DIJA_HARMBENCH) not in sys.path:
     sys.path.insert(0, str(DIJA_HARMBENCH))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from utility.generate_function import generate_llada
+if DIJA_HARMBENCH.is_dir():
+    from utility.generate_function import generate_llada
+else:
+    from utils.dija_generate_function import generate_llada
 
 
 MASK_ID = 126336
