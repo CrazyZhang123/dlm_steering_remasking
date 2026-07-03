@@ -7,7 +7,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATES_PATH = ROOT / "DIJA/benchmarks/HarmBench/baselines/pap/templates.py"
+DEFAULT_DIJA_TEMPLATES_PATH = ROOT / "DIJA/benchmarks/HarmBench/baselines/pap/templates.py"
+FALLBACK_TEMPLATES_PATH = ROOT / "utils/pap_templates_vendored.py"
+TEMPLATES_PATH = (
+    DEFAULT_DIJA_TEMPLATES_PATH
+    if DEFAULT_DIJA_TEMPLATES_PATH.is_file()
+    else FALLBACK_TEMPLATES_PATH
+)
 _TEMPLATES_MODULE_CACHE = None
 _MODEL_CACHE = {}
 AutoTokenizer = None
