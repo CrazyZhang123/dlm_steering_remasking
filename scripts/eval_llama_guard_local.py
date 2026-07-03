@@ -46,26 +46,70 @@ def generate_guard_text(tokenizer, model, response: str) -> str:
     return tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:])
 
 
-def run_evaluation(data_path: str, model_path: str, output_path: str, device: str):
+def generate_guard_texts_batch(tokenizer, model, responses: list[str]) -> list[str]:
+    """批量评判：左 pad 后一次 generate。
+
+    贪心解码下与逐条 generate_guard_text 的输出逐字一致。
+    左 pad 保证所有行的新 token 统一从 input_ids.shape[1] 起切片。
+    """
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    texts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": response}]}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        for response in responses
+    ]
+    # 模板文本已含特殊 token，二次 tokenize 时不能再加（避免双 BOS）
+    inputs = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False,
+    ).to(model.device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=40,
+        pad_token_id=tokenizer.eos_token_id,
+        cache_implementation="dynamic",
+    )
+    return [
+        tokenizer.decode(row)
+        for row in outputs[:, inputs["input_ids"].shape[1]:]
+    ]
+
+
+def run_evaluation(data_path: str, model_path: str, output_path: str, device: str, batch_size: int = 1):
     data = json.loads(Path(data_path).read_text(encoding="utf-8"))
     tokenizer, model = load_guard_model(model_path, device)
+    batch_size = max(1, int(batch_size))
 
     results = []
     unsafe_count = 0
-    for idx, item in enumerate(data):
-        response = item.get("response", "") or ""
-        judge_output = generate_guard_text(tokenizer, model, response)
-        is_unsafe = is_unsafe_text(judge_output)
-        unsafe_count += int(is_unsafe)
-        results.append(
-            {
-                "id": idx,
-                "prompt": item.get("prompt", ""),
-                "response": response,
-                "judge_output": judge_output,
-                "is_unsafe": is_unsafe,
-            }
-        )
+    for chunk_start in range(0, len(data), batch_size):
+        chunk = data[chunk_start:chunk_start + batch_size]
+        responses = [item.get("response", "") or "" for item in chunk]
+        if batch_size == 1:
+            judge_outputs = [generate_guard_text(tokenizer, model, responses[0])]
+        else:
+            judge_outputs = generate_guard_texts_batch(tokenizer, model, responses)
+
+        for offset, (item, response, judge_output) in enumerate(zip(chunk, responses, judge_outputs)):
+            is_unsafe = is_unsafe_text(judge_output)
+            unsafe_count += int(is_unsafe)
+            results.append(
+                {
+                    "id": chunk_start + offset,
+                    "prompt": item.get("prompt", ""),
+                    "response": response,
+                    "judge_output": judge_output,
+                    "is_unsafe": is_unsafe,
+                }
+            )
 
     payload = {
         "metadata": {
@@ -88,12 +132,15 @@ def main(argv=None):
     parser.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--device", default="cuda:1")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="批量评判的样本数；1 = 逐条（贪心解码下批量与逐条结果应逐字一致）")
     args = parser.parse_args(argv)
     run_evaluation(
         data_path=args.data_path,
         model_path=args.model_path,
         output_path=args.output_path,
         device=args.device,
+        batch_size=args.batch_size,
     )
 
 
