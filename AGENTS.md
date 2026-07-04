@@ -14,6 +14,13 @@
 - 不要直接依赖前台终端会话运行长任务，避免因为会话中断导致实验进程失联或退出。
 - 对于耗时较长的 baseline、steering、judge、评测任务，默认采用 `tmux` 后台运行，并将日志重定向到对应输出目录。
 
+## 批量推理与并行约定
+
+- **尽量用并行**：独立的实验/评测任务并行推进——多卡分别跑不同任务、单卡用 tmux 排队、推理与评判流水线化；新增代码优先走批量接口（`*_batch` / `--gen_batch_size` / `--batch_size`），不要新增逐条 Python 循环调用模型的路径。
+- **推理批量（`--gen_batch_size`）**：本机 V100（bf16 无 tensor core）GPU 验收实测 bs=2 为唯一正收益点（1.11x），bs=4 仅 1.06x、bs=8 反而更慢（bs=1 时 GEMM 已算力饱和，MFU 77–86%）。**默认用 `2`**；需要与历史产物逐位可比时用 `1`（无 pad 路径与旧实现逐位等价）；A100/H100 或 fp16 场景可开 4–8。依据：`docs/batch_inference_gpu_acceptance_log.md`。
+- **Llama Guard 评判批量**：`scripts/eval_llama_guard_local.py` 默认 `--batch_size 8`（100 条约 52s，收益真实）；贪心解码下批量与逐条输出逐字一致，可放心用。
+- **等价性口径**：混合长度批量运行与逐样本历史运行**不逐位一致**（Gumbel RNG 消耗形状、attention kernel 路径不同），A/B 比较按统计口径，并结合 ASR 单次噪声 ±2.5% 判读（差 <5pp 勿下结论）；`gen_batch_size=1` 与旧实现逐位等价，可用于严格回归。
+
 ## LLaDA 模型恢复约定
 
 - 本项目默认使用 `/dev/shm/LLaDA-8B-Instruct` 作为 `LLaDA-8B-Instruct` 本地模型路径。
