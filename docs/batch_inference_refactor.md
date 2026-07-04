@@ -43,16 +43,21 @@
    与逐样本运行**不逐位一致，按统计口径验收**（历史运行本就未固定种子）。
 3. **Llama Guard 批量**：贪心解码，批量与逐条输出应逐字一致。
 
-## GPU 验收清单（待跑）
+## GPU 验收清单（已完成，2026-07-03/04，详见主仓库 `docs/batch_inference_gpu_acceptance_log.md`）
 
-- [ ] B=1 逐位等价：临时 set_seed，10 条 JBB，重构前后 results.json 一致。
-- [ ] 贪心近似等价：patch `_sample_categorical` 为 argmax，10 条 bs=1 vs bs=4，
-      token 一致率 >99%、unsafe 判定一致。
-- [ ] 统计等价：JBB 100 + DIJA 100，bs=1 vs bs=4，unsafe 率差 ≤2pp，
-      `ct_csd_diagnostics` 的 activation_rate / route_count 分布相近。
-- [ ] 显存与吞吐：bs∈{1,2,4,8} × zeroshot/PAP/DIJA 计时 + `nvidia-smi` 峰值。
-      注意 float64 softmax 临时张量 ≈ `3 × B × Lmax × 126464 × 8B`：
-      zeroshot bs=8 约 +7GB；prefix 长模板（Lmax 2000+）须降 bs。
+- [x] B=1 逐位等价：**PASS**。DIJA 前 10 条、seed=42，main 旧实现 vs worktree bs=1，
+      `results.json` 逐字节一致（`cmp`）。注：验收输入用 DIJA 而非 zeroshot——
+      zeroshot + M12 steering 下模型全部拒答成空 response，等价比对是平凡通过。
+- [x] 贪心近似等价：**PASS（token 一致率 100.00%，1402/1402）**。argmax 模式，
+      10 条 bs=1 vs bs=4，response 逐字相同。
+- [x] 统计等价：**PASS**。JBB DIJA 100 条，bs=1 unsafe 70/100 vs bs=4 unsafe 71/100，
+      差 1pp ≤ 2pp（且落在 ASR 单次噪声 ±2.5% 内）。
+- [x] 显存与吞吐：完成，但**本机（V100, bf16）加速 ≈1x**（bs=2 1.11x / bs=4 1.06x /
+      bs=8 0.97x），显存 16.3→23.1 GiB 近线性。原因：V100 无 bf16 tensor core，
+      bs=1 时 GEMM 已算力饱和（MFU 77–86%）；判定为硬件预期而非代码缺陷。
+      批量收益需 A100/H100（bf16 tensor core）或 fp16 才能兑现。
+      工程建议：本机日常实验用 `--gen_batch_size 1`；Llama Guard 评判保留 batch=8
+      （短生成，100 条 ~52s，批量收益真实）。
 
 ## 后续（未含在本分支）
 
