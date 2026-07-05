@@ -61,9 +61,9 @@ sh scripts/math-500_eval.sh      # MATH-500 准确率
 | 2 | `num_total_clusters` 4/8/12/16 消融（M12 当前最低 ASR=65%） | `docs/category_aware_ct_csd_stage1_metrics.md` |
 | 3 | Category-aware clustering（按 `semantic_category` 分组） | `docs/stage3_category_ct_csd_*.md` |
 | 4 | MIL token probe + probe 阈值选择有害 token | `docs/stage4_mil_token_probe_*.md` |
-| 4A/5/6 | token selection / feature preprocessing / 组合 metadata（开发中） | `.worktrees/stage4a-stage5-stage6/` |
+| 4A/4C/4D/5/6 | direction/random/KNN token selection、feature preprocessing、组合 | `docs/stage4_abcd_progress.md` |
 
-进行中的 Stage 4A/5/6 工作位于 worktree `.worktrees/stage4a-stage5-stage6/`，改动集中在 `utils/make_ct_csd_llada.py`、`utils/ct_csd_bank.py` 及对应 tests。
+Stage 4A/4C/4D/5/6 代码已合并入 `main`（见提交 `978c191 CT-CSD bank`、`d4569a2 per-class KNN`），改动集中在 `utils/make_ct_csd_llada.py`、`utils/ct_csd_bank.py` 及对应 tests；进度与实验状态见 `docs/stage4_abcd_progress.md`。原 worktree `.worktrees/stage4a-stage5-stage6/` 已移除。
 
 ## 关键目录
 

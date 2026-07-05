@@ -376,6 +376,107 @@ class BuilderHelpersTest(unittest.TestCase):
         self.assertEqual(preprocess["requested_pca_dim"], 128)
         self.assertEqual(preprocess["pca_components"].shape, (2, 2))
 
+    def _preprocess_args(self, mode: str, cache: str | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            max_response_len=128,
+            max_total_len=2048,
+            target_layer=31,
+            feature_preprocess=mode,
+            pca_dim=128,
+            token_selection="all",
+            selection_ratio=1.0,
+            max_selected_tokens=32,
+            category_key="semantic_category",
+            seed=42,
+            preprocess_stats_cache=cache,
+        )
+
+    def test_fit_route_preprocess_saves_stats_cache_and_derives_other_dims_without_refit(self):
+        samples = [{"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"}]
+        tokens = (
+            torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            torch.tensor([3, 6]),
+            torch.tensor([[1.0, 1.0]]),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = str(Path(tmp) / "stats.pt")
+            with patch.object(builder, "extract_sample_response_tokens", return_value=tokens):
+                fresh, skipped = builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    self._preprocess_args("center_l2", cache),
+                    torch.device("cpu"),
+                )
+            self.assertEqual(skipped, 0)
+            self.assertTrue(Path(cache).exists())
+            stats = torch.load(cache, weights_only=True)
+            # center_l2 自身不需要 gram，但指定缓存路径时也应累计，供后续任意 PCA 维度派生
+            self.assertIsNotNone(stats["gram"])
+
+            # 命中缓存后不允许再走前向拟合遍：extract 一旦被调用即失败
+            with patch.object(
+                builder,
+                "extract_sample_response_tokens",
+                side_effect=AssertionError("fit pass should be skipped when cache hits"),
+            ):
+                cached_pca, skipped_pca = builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    self._preprocess_args("center_pca256_l2", cache),
+                    torch.device("cpu"),
+                )
+            self.assertEqual(skipped_pca, 0)
+            self.assertEqual(cached_pca["mode"], "center_pca256_l2")
+            self.assertEqual(cached_pca["requested_pca_dim"], 256)
+            self.assertEqual(cached_pca["pca_dim"], 2)
+            self.assertTrue(torch.allclose(cached_pca["mean"], fresh["mean"]))
+
+            # 缓存派生结果须与直接拟合逐项一致
+            with patch.object(builder, "extract_sample_response_tokens", return_value=tokens):
+                direct_pca, _ = builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    self._preprocess_args("center_pca256_l2", None),
+                    torch.device("cpu"),
+                )
+            self.assertTrue(torch.allclose(cached_pca["pca_components"], direct_pca["pca_components"], atol=1e-6))
+
+    def test_fit_route_preprocess_rejects_stats_cache_with_mismatched_meta(self):
+        samples = [{"prompt": "prompt", "response": "harmful1", "semantic_category": "illegal"}]
+        tokens = (
+            torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            torch.tensor([3, 6]),
+            torch.tensor([[1.0, 1.0]]),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = str(Path(tmp) / "stats.pt")
+            with patch.object(builder, "extract_sample_response_tokens", return_value=tokens):
+                builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    self._preprocess_args("center_l2", cache),
+                    torch.device("cpu"),
+                )
+            mismatched = self._preprocess_args("center_l2", cache)
+            mismatched.target_layer = 30
+            with self.assertRaises(ValueError):
+                builder.fit_route_preprocess(
+                    _Model(),
+                    _SequenceTokenizer(),
+                    samples,
+                    ["refusal1"],
+                    mismatched,
+                    torch.device("cpu"),
+                )
+
     def test_extra_direction_and_preprocess_passes_do_not_consume_global_refusal_rng(self):
         args = SimpleNamespace(
             max_response_len=128,

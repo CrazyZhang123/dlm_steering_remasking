@@ -49,11 +49,23 @@ CATEGORY_FALLBACK_KEYS = ("semantic_category", "functional_category", "category"
 
 
 def resolve_category(sample: dict, category_key: str | None = None) -> str:
+    """
+    这函数就干一件事：从一条有害样本的 JSON 里找到它的类别标签。
+    样本 JSON 长这样：
+        {
+        "prompt": "如何制作炸弹",
+        "semantic_category": "violence",
+        "functional_category": "instruction"
+        }
+    """
+    # 优先用调用者指定的 key，再用兜底 key 列表依次尝试
     keys: list[str] = []
+    # 给了就先用给了的category
     if category_key:
         keys.append(category_key)
+    # 然后用其他的category兜底。
     keys.extend(key for key in CATEGORY_FALLBACK_KEYS if key not in keys)
-
+    # 取出category，没有就用兜底的。
     for key in keys:
         value = sample.get(key)
         if value is None:
@@ -61,18 +73,22 @@ def resolve_category(sample: dict, category_key: str | None = None) -> str:
         text = str(value).strip()
         if text:
             return text
+    # 所有 key 都取不到值，返回 "unknown"
     return "unknown"
 
 
 def keep_response_token(tokenizer, token_id: int) -> bool:
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    # 把所有special token的token_id全调出来
     for attr in ("pad_token_id", "eos_token_id", "bos_token_id", "mask_token_id"):
         value = getattr(tokenizer, attr, None)
         if value is not None:
             special_ids.add(int(value))
+    # 是特殊token的返回 false，对应后面tensor里面是0
     if int(token_id) in special_ids:
         return False
     text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    #  decode 后为空白的 → 也过滤
     return bool(text.strip())
 
 
@@ -90,10 +106,12 @@ def filter_response_tokens(
     response_ids: torch.Tensor,
     hidden: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # 对每个 token 判断是否保留：去掉特殊 token（pad/eos/bos/mask）和空白 token
     keep = torch.tensor(
         [keep_response_token(tokenizer, int(token_id)) for token_id in response_ids[: hidden.shape[0]]],
         dtype=torch.bool,
     )
+    # 只保留有效 token 的 hidden state 和对应的 token id
     return hidden[keep], response_ids[: hidden.shape[0]][keep]
 
 
@@ -349,7 +367,16 @@ def make_category_cluster_plan(
     """
     给定各类别的 token 数和 cluster 总数，按比例分配每个类别应分到几个 cluster。
     如果类别太多就合并尾巴到 "other"，最后用最大余数法微调使总数精确匹配预算。
+
+    说人话：
+     总预算: N 个 cluster
+      make_category_cluster_plan          
+      "A 类 650 token → 分 7 个 cluster   
+       B 类 250 token → 分 2 个 cluster   
+       C 类 100 token → 分 1 个 cluster"
     """
+
+    # 聚类总数
     if num_total_clusters <= 0:
         raise ValueError("num_total_clusters must be positive")
 
@@ -362,16 +389,18 @@ def make_category_cluster_plan(
     if not positive:
         raise RuntimeError("No category has usable harmful response tokens.")
 
-    # 按 token 数降序排列，token 数相同时按类别名升序
+    # 按 token 数 降序 排列，token 数相同时按 类别名 升序
     # 原理是 Python 元组排序的逐项比较规则：(-count, category_name)
     # 1. 先比 -count：-100 < -50，所以 100 的排在 50 前面 → 实现了 token 数降序。
     # 2. 如果两个 -count 相等（即 token 数相同），再比 category_name："fraud" < "violence" 字符串字母序 → 同 token 数时按名字升序。
     ranked = sorted(positive.items(), key=lambda item: (-item[1], item[0]))
+    # raw_to_center_category 记录映射关系，供后续将原始类别日志中心映射到折叠后类别用。
     raw_to_center_category: dict[str, str] = {}
 
     # 如果类别数超过了总 cluster 数，需要将尾部类别折叠到 "other"
     if len(ranked) > num_total_clusters:
         if num_total_clusters == 1:
+             # 全部折叠到 other
             kept: list[tuple[str, int]] = []
             tail = ranked
         else:
@@ -384,10 +413,12 @@ def make_category_cluster_plan(
         for category, _count in tail:
             raw_to_center_category[category] = "other"
     else:
+        # 没超过聚类簇数的，直接建立category的映射关系
         collapsed = dict(ranked)
         raw_to_center_category = {category: category for category in collapsed}
 
     categories = sorted(collapsed)
+    # 即使折叠后，类别数仍不能超过 cluster 预算（理论上不会发生，但防御性检查）。
     if num_total_clusters < len(categories):
         raise RuntimeError(
             f"Collapsed category count {len(categories)} exceeds cluster budget {num_total_clusters}."
@@ -515,16 +546,28 @@ def top_ratio_select(
 
 
 def _coarse_direction_for_sample(sample: dict, args) -> torch.Tensor | None:
+    # direction_type 控制用全局方向还是按类别方向
+    # getattr(obj, attr, default) 是 Python 内置函数：从 args 对象上取属性 
     direction_type = getattr(args, "coarse_direction_type", "category")
     global_direction = getattr(args, "global_coarse_direction", None)
+    # 如果指定了全局模式，直接用全局方向，不看类别
     if direction_type == "global":
         return global_direction
 
+    # 按类别模式：先取样本的类别，再查该类别的粗方向
     category = resolve_category(sample, getattr(args, "category_key", None))
     directions = getattr(args, "coarse_directions_by_category", {}) or {}
+    # 取每个类别的 token 数统计
     counts = getattr(args, "coarse_direction_token_counts", {}) or {}
     min_tokens = int(getattr(args, "min_coarse_tokens", 0))
+    # 每个类别都有一个方向向量——fit_coarse_directions 函数
+        #     directions = {
+        #     category: (category_sums[category] / float(category_counts[category])) - safe_mean
+        #     for category in category_sums
+        # # }
     direction = directions.get(category)
+    # 只有类别方向存在且 token 数超过阈值时，才用类别方向
+    # 否则 fallback 到全局方向（少量 token 算出的方向不可靠）
     if direction is not None and int(counts.get(category, 0)) >= min_tokens:
         return direction
     return global_direction
@@ -667,6 +710,7 @@ def build_knn_keep_masks(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             continue
+        # 删除special tokens（<pad>, </s>, <s>, <mask> 等）
         h_tokens, h_token_ids = filter_response_tokens(tokenizer, response_ids_h, h_tokens)
         for pos in range(int(h_tokens.shape[0])):
             harmful_vectors.append(h_tokens[pos])
@@ -763,12 +807,18 @@ def select_harmful_response_tokens(
     sample: dict,
     args,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # 读取 token 选择策略，默认 "all"（全保留）
     mode = getattr(args, "token_selection", "all")
+    # "all" 和 "mil_probe_threshold" 两个模式不在这里处理:
+    #   - "all": 全部保留，不需要筛选
+    #   - "mil_probe_threshold": 由 iter_valid_sample_tokens 中的 probe 逻辑处理
     if mode in {None, "all", "mil_probe_threshold"} or hidden.numel() == 0:
         return hidden, token_ids
 
     ratio = float(getattr(args, "selection_ratio", 1.0))
     max_selected = getattr(args, "max_selected_tokens", None)
+
+    # ─── direction_top_ratio: 按与粗方向的一致性打分，取最高分的 top-ratio ───
     if mode == "direction_top_ratio":
         direction = _coarse_direction_for_sample(sample, args)
         if direction is None:
@@ -776,41 +826,61 @@ def select_harmful_response_tokens(
         direction = direction.to(device=hidden.device, dtype=hidden.dtype)
         if direction.numel() == 0 or float(direction.norm().item()) <= 0.0:
             return hidden, token_ids
+        # 每个 token 与粗方向做点积，得分越高说明越"典型有害"
         scores = hidden @ unit(direction).reshape(-1)
         selected_hidden, selected_ids, _scores, _mask = top_ratio_select(hidden, token_ids, scores, ratio, max_selected)
         return selected_hidden, selected_ids
 
+    # ─── random_top_ratio: 随机抽 top-ratio%，只用于 baseline 对照 ───
     if mode == "random_top_ratio":
+        # hidden.shape[0] 是当前样本有害 token 的总数。selected_token_count 计算要保留多少个：
         count = selected_token_count(int(hidden.shape[0]), ratio, max_selected)
         if count == 0:
             return hidden[:0], token_ids[:0]
+        # PyTorch 的随机数生成器对象。device="cpu" 在 CPU 上生成随机数（torch.randperm 在 GPU 上有坑，所以放 CPU）。
         generator = torch.Generator(device="cpu")
+        # 种子 = 全局种子 + 样本索引。
         seed = int(getattr(args, "seed", 0)) + int(getattr(args, "_sample_index", 0))
         generator.manual_seed(seed)
         indices = torch.randperm(int(hidden.shape[0]), generator=generator)[:count]
+        # 排序成 [0, 3, 4]，为了保持 token 的原始顺序（否则 hidden state 乱序会导致后续逻辑出错）。
         indices = indices.sort().values.to(device=hidden.device)
         return hidden[indices], token_ids[indices.cpu()]
 
+    # ─── knn_label_clean: 用 pass 0 预计算的 KNN/ENN keep mask 过滤 ───
     if mode == "knn_label_clean":
-        # 全局 KNN/ENN 标签去噪：保留结论在 pass 0 由 build_knn_keep_masks 预计算。
+        # 。build_knn_keep_masks 的输出（L774-777）就是 select_harmful_response_tokens 中 mask 的来源：
+        # 简单理解： true是有害的，保留
+        #     # build_knn_keep_masks 的返回值 — 每个样本一个 bool mask
+        #     masks = {                  # ← 这就是 args._knn_keep_masks
+        #         0: [True, True, False, True, ...],   # 样本 0：3 号 token 被 KNN 判定为噪声
+        #         1: [True, True, True, ...],          # 样本 1：全部保留
+        #         2: [False, True, False, ...],        # 样本 2：1 号和 3 号被 KNN 判定为噪声
+        #     }
+        # 从 args 中取出 pass 0 预计算好的所有样本的 keep mask
         masks = getattr(args, "_knn_keep_masks", None)
         if masks is None:
-            # 预处理阶段（fit_route_preprocess）缓存未就绪 → 等效 "all"，不在此处过滤。
+            # 预处理阶段尚未缓存 mask（例如在 fit_route_preprocess 中），暂时不筛选
             return hidden, token_ids
+        # 用样本索引取出对应的 mask（bool 张量，True 表示保留）
+        # 翻到了 → mask 就是一组 True/False，告诉你每个 token 能不能要
         mask = masks.get(int(getattr(args, "_sample_index", -1)))
         if mask is None:
-            # 该样本在 pass 0 被跳过（如长度超限），保守保留并告警以便诊断。
+            # 如果 mask 不存在，说明该样本在 KNN pass 0 中被跳过
+            # 保守起见保留所有 token，但给出告警以提示可能的数据不一致
             warnings.warn(
                 f"[knn_label_clean] sample {getattr(args, '_sample_index', -1)} 无 keep mask，保守保留全部 token",
                 RuntimeWarning,
                 stacklevel=2,
             )
             return hidden, token_ids
+        # 防御性检查：mask 长度必须与当前提取的 token 数一致
         if mask.shape[0] != hidden.shape[0]:
             raise RuntimeError(
                 f"KNN keep mask 与 token 序列错位: mask={mask.shape[0]} vs hidden={hidden.shape[0]} "
                 f"(sample {getattr(args, '_sample_index', -1)})"
             )
+        # 用 mask 过滤 token，只保留"干净"的
         keep = mask.to(device=hidden.device)
         return hidden[keep], token_ids[mask.cpu()]
 
@@ -873,20 +943,33 @@ def extract_sample_response_tokens(
     args,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """
+        给同一个 prompt 分别接上"有害回答"和"拒绝回答"，前向模型，从指定层取出两类响应的 hidden state。
+    """
+    # 从样本中取出 prompt 和有害响应，缺一不可
     prompt = sample.get("prompt", "").strip()
     harmful_resp = sample.get("response", "").strip()
     if not prompt or not harmful_resp:
         return None
 
+    # 构建两个序列：[prompt + harmful_response] 和 [prompt + refusal_response]
+    # 返回: input_ids, 各 token 属于 response 区域的标记, response 部分的 token ids
     ids_h, rs_h, response_ids_h = build_sequence(tokenizer, prompt, harmful_resp, args.max_response_len)
     ids_s, rs_s, response_ids_s = build_sequence(tokenizer, prompt, refusal, args.max_response_len)
+    # 超长截断
     if len(ids_h) > args.max_total_len or len(ids_s) > args.max_total_len:
         return None
 
+    # 前向模型，提取目标层的 hidden state，只保留 response 区域的 token
+    # extract_target_layer_tokens 内部会按 rs_h/rs_s 的 mask 只取 response 部分
     h_tokens = extract_target_layer_tokens(model, ids_h.unsqueeze(0), rs_h, args.target_layer, device)
     s_tokens = extract_target_layer_tokens(model, ids_s.unsqueeze(0), rs_s, args.target_layer, device)
+
+    # 过滤掉 response 中的特殊 token（pad/eos/bos/mask），只保留文本 token
     h_tokens, h_token_ids = filter_response_tokens(tokenizer, response_ids_h, h_tokens)
     s_tokens = filter_response_hidden_states(tokenizer, response_ids_s, s_tokens)
+
+    # 返回: 有害 token 的 hidden state + token id, 拒绝 token 的 hidden state
     return h_tokens, h_token_ids, s_tokens
 
 
@@ -970,6 +1053,50 @@ def fit_coarse_directions(
     return directions, category_counts, global_direction, skipped
 
 
+def preprocess_stats_cache_meta(args, num_samples: int) -> dict:
+    """统计量缓存的口径元数据：与 token_sum/gram 取值强相关的参数，加载时逐项校验，防止跨口径复用。"""
+    return {
+        "target_layer": int(args.target_layer),
+        "token_selection": str(getattr(args, "token_selection", "all")),
+        "selection_ratio": float(getattr(args, "selection_ratio", 1.0)),
+        "max_response_len": int(args.max_response_len),
+        "num_samples": int(num_samples),
+    }
+
+
+def _preprocess_from_stats(
+    mode: str,
+    token_sum: torch.Tensor,
+    gram: torch.Tensor | None,
+    token_count: int,
+    requested_pca_dim: int | None,
+) -> dict:
+    """由累计统计量派生 preprocess 状态。mean/gram 与目标维度无关，同一份统计量可派生任意 PCA 维度。"""
+    if token_count <= 0 or token_sum is None:
+        raise RuntimeError("No response tokens available for route preprocessing.")
+    mean = token_sum / float(token_count)
+    preprocess = {"mode": mode, "mean": mean.float().cpu()}
+    if requested_pca_dim is not None:
+        if gram is None:
+            raise RuntimeError("PCA preprocessing requires accumulated gram statistics.")
+        actual_dim = min(int(requested_pca_dim), int(token_count), int(mean.shape[0]))
+        if actual_dim <= 0:
+            raise RuntimeError("PCA preprocessing requires at least one response token and one feature dimension.")
+        covariance = gram - float(token_count) * torch.outer(mean, mean)
+        covariance = (covariance + covariance.T) * 0.5
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        top_indices = torch.argsort(eigenvalues, descending=True)[:actual_dim]
+        components = eigenvectors[:, top_indices].T.contiguous()
+        max_abs_indices = components.abs().argmax(dim=1)
+        signs = components[torch.arange(components.shape[0]), max_abs_indices].sign()
+        signs[signs == 0] = 1
+        components = components * signs.unsqueeze(1)
+        preprocess["pca_components"] = components.float().cpu()
+        preprocess["pca_dim"] = int(actual_dim)
+        preprocess["requested_pca_dim"] = int(requested_pca_dim)
+    return preprocess
+
+
 def fit_route_preprocess(
     model,
     tokenizer,
@@ -985,6 +1112,28 @@ def fit_route_preprocess(
         raise ValueError(f"Unsupported feature_preprocess: {mode!r}")
 
     requested_pca_dim = pca_dim_for_mode(mode, int(getattr(args, "pca_dim", 128)))
+    cache_path_arg = getattr(args, "preprocess_stats_cache", None)
+    cache_path = Path(cache_path_arg) if cache_path_arg else None
+    expected_meta = preprocess_stats_cache_meta(args, len(harmful))
+
+    if cache_path is not None and cache_path.exists():
+        stats = torch.load(cache_path, map_location="cpu", weights_only=True)
+        cached_meta = stats.get("meta")
+        if cached_meta != expected_meta:
+            raise ValueError(
+                f"preprocess stats cache 口径不匹配: cached={cached_meta} expected={expected_meta}; "
+                f"请更换缓存路径或删除 {cache_path}"
+            )
+        if requested_pca_dim is not None and stats.get("gram") is None:
+            raise ValueError(f"preprocess stats cache 缺少 gram 统计量，无法派生 PCA: {cache_path}")
+        print(f"Loaded preprocess stats cache <- {cache_path} (skip fit pass)")
+        preprocess = _preprocess_from_stats(
+            mode, stats["token_sum"], stats.get("gram"), int(stats["token_count"]), requested_pca_dim
+        )
+        return preprocess, int(stats.get("skipped", 0))
+
+    # 指定缓存路径时无条件累计 gram：GPU 上多一次矩阵乘，换来同一份缓存可派生任意 PCA 维度
+    need_gram = requested_pca_dim is not None or cache_path is not None
     token_sum = None
     token_count = 0
     gram = None
@@ -994,10 +1143,12 @@ def fit_route_preprocess(
         nonlocal token_sum, token_count, gram
         if tokens.numel() == 0:
             return
-        data = tokens.float().cpu()
+        # 统计量在 token 所在设备（通常 GPU）上累加，收尾统一回 CPU；
+        # 逐样本搬回 CPU 做 4096x4096 累加曾是整个拟合遍的耗时瓶颈（~3s/样本 → 前向瓶颈 ~1s/样本）
+        data = tokens.detach().float()
         token_sum = data.sum(dim=0) if token_sum is None else token_sum + data.sum(dim=0)
         token_count += int(data.shape[0])
-        if requested_pca_dim is not None:
+        if need_gram:
             partial_gram = data.T @ data
             gram = partial_gram if gram is None else gram + partial_gram
 
@@ -1031,25 +1182,24 @@ def fit_route_preprocess(
     if token_count <= 0 or token_sum is None:
         raise RuntimeError("No response tokens available for route preprocessing.")
 
-    mean = token_sum / float(token_count)
-    preprocess = {"mode": mode, "mean": mean.float().cpu()}
-    if requested_pca_dim is not None:
-        actual_dim = min(int(requested_pca_dim), int(token_count), int(mean.shape[0]))
-        if actual_dim <= 0:
-            raise RuntimeError("PCA preprocessing requires at least one response token and one feature dimension.")
-        covariance = gram - float(token_count) * torch.outer(mean, mean)
-        covariance = (covariance + covariance.T) * 0.5
-        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
-        top_indices = torch.argsort(eigenvalues, descending=True)[:actual_dim]
-        components = eigenvectors[:, top_indices].T.contiguous()
-        max_abs_indices = components.abs().argmax(dim=1)
-        signs = components[torch.arange(components.shape[0]), max_abs_indices].sign()
-        signs[signs == 0] = 1
-        components = components * signs.unsqueeze(1)
-        preprocess["pca_components"] = components.float().cpu()
-        preprocess["pca_dim"] = int(actual_dim)
-        preprocess["requested_pca_dim"] = int(requested_pca_dim)
-    return preprocess, skipped
+    token_sum = token_sum.float().cpu()
+    gram = gram.float().cpu() if gram is not None else None
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "token_sum": token_sum,
+                "gram": gram,
+                "token_count": int(token_count),
+                "skipped": int(skipped),
+                "meta": expected_meta,
+            },
+            cache_path,
+        )
+        print(f"Saved preprocess stats cache -> {cache_path}")
+
+    return _preprocess_from_stats(mode, token_sum, gram, token_count, requested_pca_dim), skipped
 
 
 def route_centers_from_kmeans(kmeans) -> torch.Tensor | None:
@@ -1167,15 +1317,23 @@ def iter_valid_sample_tokens(
     args,
     device: torch.device,
 ):
+    # 前向模型，提取有害响应 token 和拒绝响应 token 的 hidden state
     item = extract_sample_response_tokens(model, tokenizer, sample, refusal, args, device)
     if item is None:
         return None
 
     h_tokens, h_token_ids, s_tokens = item
+    # h_tokens: (num_harmful_tokens, d_model) — 有害响应中每个 token 的 hidden state
+    # h_token_ids: (num_harmful_tokens,) — 对应 token id
+    # s_tokens: (num_safe_tokens, d_model) — 拒绝响应中每个 token 的 hidden state
+
     mil_probe = getattr(args, "mil_probe", None)
     if mil_probe is not None and h_tokens.numel() > 0:
+        # 用 probe 给每个有害 token 打分，分数越高越 "有害"
         scores = score_tokens_with_probe(mil_probe, h_tokens)
         selected_mask = scores >= float(args.probe_threshold)
+
+        # 可选：记录每个 token 的 probe 得分和选中情况（用于事后分析）
         category = resolve_category(sample, getattr(args, "category_key", None))
         diagnostics = getattr(args, "probe_diagnostics", None)
         record_probe_diagnostics = bool(getattr(args, "record_probe_diagnostics", True))
@@ -1189,19 +1347,38 @@ def iter_valid_sample_tokens(
                 scores=scores,
                 selected_mask=selected_mask,
             )
+
+        # 只保留分数 >= 阈值的 token（过滤掉不够有害的 token）
         h_tokens, h_token_ids, _kept_scores = apply_probe_threshold(
             h_tokens,
             h_token_ids,
             scores,
             float(args.probe_threshold),
         )
+
+        # 如果一个样本的所有 token 都被 probe 筛掉，记个数
         if h_tokens.numel() == 0 and record_probe_diagnostics:
             args.probe_empty_samples = int(getattr(args, "probe_empty_samples", 0)) + 1
+
     elif h_tokens.numel() > 0:
+        # 没有 probe：按原始策略（方向 top-ratio / 全部保留）筛选 token
         h_tokens, h_token_ids = select_harmful_response_tokens(h_tokens, h_token_ids, sample, args)
+
+    # 把被筛选后的 token ids 存到 args，供下游函数记录 cluster_token_terms
     args._last_harmful_token_ids = h_token_ids
+    # 流程：
+    # 原始有害 token (比如 50 个)
+    #     ↓
+    # select_harmful_response_tokens / probe 筛选
+    #     ↓
+    # 保留下来的 token (比如 10 个)  ← 只拿这些去聚类
+    #     ↓
+    # transform → k-means 训练 / 累加
+    # 拒绝响应必须至少有一个 token，否则该样本无效
     if s_tokens.numel() == 0:
         return None
+
+    # 返回：筛选后的有害 token hidden state、safe 向量的均值（全 token 平均）
     return h_tokens, s_tokens.mean(dim=0)
 
 
@@ -1272,34 +1449,49 @@ def fit_category_minibatch_kmeans(
     category_plan: dict,
     kmeans_factory=None,
 ):
+    # 如果没有传入工厂函数，用默认的 MiniBatchKMeans
+    # 每个类别的 n_clusters 由 category_plan 指定
     if kmeans_factory is None:
         def kmeans_factory(_category: str, n_clusters: int):
             return MiniBatchKMeans(
-                n_clusters=n_clusters,
+                n_clusters=n_clusters, # 聚类中心
+                # 每次 partial_fit 用多少样本更新模型。MiniBatchKMeans 不是一次性看所有数据，而是每批来一点就做一次增量更新。
                 batch_size=args.kmeans_batch_size,
                 random_state=args.seed,
-                n_init="auto",
+                n_init="auto", # 自动决定初始化次数；sklearn 会选对算法合适的默认值
             )
 
+    # 给每个类别创建独立的 kmeans 实例，cluster 数 = plan 分配的数
     kmeans_by_category = {
         category: kmeans_factory(category, int(category_plan["category_cluster_counts"][category]))
         for category in category_plan["categories"]
     }
+    # 每个类别的特征 buffer（首次 partial_fit 需要先攒够 required 个样本）
     buffers: dict[str, list[torch.Tensor]] = {category: [] for category in category_plan["categories"]}
+    # 每个类别已经执行 partial_fit 的次数
     fitted_batches: dict[str, int] = {category: 0 for category in category_plan["categories"]}
     safe_sum = None
     safe_count = 0
     skipped = 0
 
     for idx, sample in enumerate(tqdm(harmful, desc="Stage 3 pass 1: fit category clusters")):
+        # 解析样本的原始类别，按 plan 折叠（尾巴类别归入 "other"）
         raw_category = resolve_category(sample, getattr(args, "category_key", None))
+        # 大部分类别确实是 identity 映射（自己→自己），但尾部那些被折叠到 "other" 的类别映射不一样。
+        # .get(raw_category, raw_category) 的第二个 raw_category 是兜底——万一 
+        # raw_category 不在 mapping 里（数据异常），就原样返回。
         category = category_plan["raw_to_center_category"].get(raw_category, raw_category)
+        # 不在预期的类别里，就跳过。
         if category not in kmeans_by_category:
             skipped += 1
             continue
+        # 从拒绝样本列表中随机选一条（如 "I cannot help with that"），作为当前有害样本的"对照"——steering 的方向是"有害 → 拒绝"，所以需要一对样本。
         refusal = random.choice(refusals)
+        # 把当前样本索引暂存到 args 里，使得下游函数可以知道自己在处理第几个样本（比如用于日志或状态追踪）。
         args._sample_index = idx
-        args.record_probe_diagnostics = False
+        # 记录 probe 筛选的诊断信息，用于分析 "每个 cluster 筛掉了多少 token"、"probe 阈值是否合适"等问题
+        args.record_probe_diagnostics = False  # pass 1 不记录 probe 诊断
+        # 对样本做一次前向，提取有害 token 的 hidden state
         try:
             item = iter_valid_sample_tokens(model, tokenizer, sample, refusal, args, device)
         except RuntimeError as exc:
@@ -1316,31 +1508,36 @@ def fit_category_minibatch_kmeans(
             skipped += 1
             continue
 
-        h_tokens, safe_mean_i = item
+        h_tokens, safe_mean_i = item  # (num_harmful_tokens, d_model), (d_model,)
         safe_sum = safe_mean_i if safe_sum is None else safe_sum + safe_mean_i
         safe_count += 1
         if h_tokens.numel() == 0:
             skipped += 1
             continue
 
+        # 对 hidden state 做可选的 route 预处理，转到 CPU
         features = transform_route_features(h_tokens, getattr(args, "route_preprocess", None)).cpu()
         required = int(category_plan["category_cluster_counts"][category])
+        # 首次拟合：攒够 required 个 token 后再 partial_fit
         if fitted_batches[category] == 0:
             buffers[category].append(features)
             buffered = torch.cat(buffers[category], dim=0)
             if buffered.shape[0] < required:
-                continue
+                continue  # 还没攒够，等更多样本
             kmeans_by_category[category].partial_fit(buffered.numpy())
             buffers[category].clear()
         else:
+            # 后续每次来一个样本的特征就增量更新
             kmeans_by_category[category].partial_fit(features.numpy())
         fitted_batches[category] += 1
 
+    # 检查是否有类别一次都没拟合到
     missing = [category for category, count in fitted_batches.items() if count == 0]
     if missing or safe_count == 0:
         raise RuntimeError(
             f"No samples processed successfully for category clusters: missing={missing}, safe_count={safe_count}"
         )
+    # 返回：每个类别的 kmeans、safe 向量的均值 和 跳过的样本数
     return kmeans_by_category, safe_sum / safe_count, skipped
 
 
@@ -1579,6 +1776,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--min_coarse_tokens", type=int, default=1024)
     parser.add_argument("--feature_preprocess", choices=FEATURE_PREPROCESS_CHOICES, default="l2_only")
     parser.add_argument("--pca_dim", type=int, default=128)
+    parser.add_argument(
+        "--preprocess_stats_cache",
+        default=None,
+        help="预处理统计量缓存路径（token_sum/gram/token_count）。文件存在则校验口径后跳过拟合遍直接派生；"
+        "不存在则拟合后写入。同一份缓存可派生 center_l2 与任意 center_pca{N}_l2",
+    )
     parser.add_argument("--num_total_clusters", type=int, default=16)
     parser.add_argument("--kmeans_batch_size", type=int, default=4096)
     parser.add_argument("--device", default="cuda")
