@@ -16,6 +16,12 @@
 - 判读规则：
   - 单次推理噪声约 `±2.5pp`
   - 三轮均值相对 `67.7` 下降至少 `5pp` 才视为明确收益
+- 本地补充来源：
+  - `docs/session_notes_20260630_0702_stage4a_tokensel.md` 中关于 `M12` 重跑 `65/70/68`
+    与“推理天然非确定”的判断，已并入本文的噪声口径
+  - `docs/stage5_ct_csd_pca128_m_scan_12_9_10_11_log.md` 中关于 `center_pca128_l2`
+    的 `70/70/72` 结果，已并入 Stage 5 汇总
+  - `docs/batch_inference_gpu_acceptance_log.md` 属于工程性能验收，不纳入方法 ASR 主表
 
 ## 2. 主结果总览
 
@@ -180,3 +186,23 @@
 - `docs/sure_sorry_csd_scan_log.md`
 
 如需追溯原始时间线、逐轮日志或诊断文件，统一去 `docs/archive/` 与 `outputs/` 查看。
+
+## 10. 本地保留归档说明
+
+主工作区历史上存在一批未提交的实验日志与会话笔记。为保护本地现场，这些文件不删除，
+统一放入 `docs/archive/local_preserved/`，同时将其中会影响方法结论的内容吸收到本文：
+
+- `session_notes_20260630_0702_stage4a_tokensel.md`
+  - 已吸收：M12 三轮基线噪声判断、token-selection 路线关闭结论
+- `stage2_ct_csd_m_scan_9_10_11_log.md`
+  - 已吸收：M9/M10/M11 三轮均值与运行时间
+- `stage4_abcd_progress.md`
+  - 已吸收：direction / random / KNN 的结论
+- `stage5_ct_csd_pca128_m_scan_12_9_10_11_log.md`
+  - 已吸收：`center_pca128_l2` 的 M12 三轮结果
+- `stage5_m12_preprocess_ablation_log.md`
+  - 已吸收：`center_l2` / `center_pca256_l2` 的三轮结果与时间
+- `steering_hparam_scan_log.md`
+  - 已吸收：`overshoot / isr` 扫描结果
+- `batch_inference_gpu_acceptance_log.md`
+  - 仅保留工程验收用途，不进入方法 ASR 比较
